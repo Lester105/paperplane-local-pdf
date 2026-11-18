@@ -393,7 +393,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .paper-shadow { position: relative; background: #fff; box-shadow: 0 4px 17px #19263f12, 0 0 0 1px #e6e8ed; }
 .pdf-canvas { display: block; }
 .annotation-layer { position: absolute; inset: 0; overflow: hidden; }
-.annotation-layer.tool-text, .annotation-layer.tool-highlight { cursor: crosshair; }
+.annotation-layer.tool-text, .annotation-layer.tool-highlight { cursor: crosshair; touch-action: none; }
 .annotation-layer.tool-draw { cursor: crosshair; touch-action: none; }
 .text-annotation {
   position: absolute;
@@ -410,6 +410,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   border-radius: 2px;
   opacity: .38;
   cursor: pointer;
+  contain: layout paint;
+  will-change: left, top, width, height;
 }
 .highlight-annotation.selected { outline: 1px solid #4774f3; outline-offset: 1px; opacity: .45; }
 .highlight-resize-handle {

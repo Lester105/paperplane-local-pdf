@@ -135,6 +135,12 @@ function Viewer({
   const [rendering, setRendering] = useState(true);
   const [penPreview, setPenPreview] = useState<Point[] | null>(null);
   const highlightDrag = useRef<{ id: string; start: Point } | null>(null);
+  const highlightFrame = useRef<number | null>(null);
+  const highlightLatestPoint = useRef<Point | null>(null);
+
+  useEffect(() => () => {
+    if (highlightFrame.current !== null) window.cancelAnimationFrame(highlightFrame.current);
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -207,6 +213,7 @@ function Viewer({
       event.currentTarget.setPointerCapture(event.pointerId);
       const point = getPoint(event);
       const start = { x: Math.min(point.x, 0.98), y: Math.min(point.y, 0.965) };
+      highlightLatestPoint.current = start;
       highlightDrag.current = { id: onHighlightStart(start), start };
       return;
     }
@@ -217,16 +224,34 @@ function Viewer({
 
   const handlePointerMove = (event: PointerEvent<HTMLDivElement>) => {
     if (highlightDrag.current) {
-      onHighlightDrag(highlightDrag.current.id, highlightDrag.current.start, getPoint(event));
+      const point = getPoint(event);
+      highlightLatestPoint.current = point;
+      if (highlightFrame.current !== null) return;
+      highlightFrame.current = window.requestAnimationFrame(() => {
+        highlightFrame.current = null;
+        if (!highlightDrag.current || !highlightLatestPoint.current) return;
+        onHighlightDrag(highlightDrag.current.id, highlightDrag.current.start, highlightLatestPoint.current);
+      });
       return;
     }
     if (!penPreview) return;
     setPenPreview((current) => (current ? [...current, getPoint(event)] : null));
   };
 
-  const handlePointerUp = () => {
+  const handlePointerUp = (event: PointerEvent<HTMLDivElement>) => {
     if (highlightDrag.current) {
+      if (highlightLatestPoint.current) {
+        if (highlightFrame.current !== null) {
+          window.cancelAnimationFrame(highlightFrame.current);
+          highlightFrame.current = null;
+        }
+        onHighlightDrag(highlightDrag.current.id, highlightDrag.current.start, highlightLatestPoint.current);
+      }
       highlightDrag.current = null;
+      highlightLatestPoint.current = null;
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
       return;
     }
     if (penPreview && penPreview.length > 1) onPenCommit(penPreview);
@@ -369,6 +394,27 @@ function ResizeHandle({
   onResizeStart: (point: Point) => void;
   onResize: (point: Point) => void;
 }) {
+  const resizeFrame = useRef<number | null>(null);
+  const latestPoint = useRef<Point | null>(null);
+
+  useEffect(() => () => {
+    if (resizeFrame.current !== null) window.cancelAnimationFrame(resizeFrame.current);
+  }, []);
+
+  const finishResize = (event: PointerEvent<HTMLSpanElement>) => {
+    if (latestPoint.current) {
+      if (resizeFrame.current !== null) {
+        window.cancelAnimationFrame(resizeFrame.current);
+        resizeFrame.current = null;
+      }
+      onResize(latestPoint.current);
+    }
+    latestPoint.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
+
   return (
     <span
       className={`highlight-resize-handle handle-${position}`}
@@ -384,21 +430,30 @@ function ResizeHandle({
         const layer = event.currentTarget.closest(".annotation-layer");
         if (!layer) return;
         const rect = layer.getBoundingClientRect();
-        onResizeStart({
+        const point = {
           x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
           y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)),
-        });
+        };
+        latestPoint.current = null;
+        onResizeStart(point);
       }}
       onPointerMove={(event) => {
         if (!event.currentTarget.hasPointerCapture(event.pointerId)) return;
         const layer = event.currentTarget.closest(".annotation-layer");
         if (!layer) return;
         const rect = layer.getBoundingClientRect();
-        onResize({
+        latestPoint.current = {
           x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
           y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)),
+        };
+        if (resizeFrame.current !== null) return;
+        resizeFrame.current = window.requestAnimationFrame(() => {
+          resizeFrame.current = null;
+          if (latestPoint.current) onResize(latestPoint.current);
         });
       }}
+      onPointerUp={finishResize}
+      onPointerCancel={finishResize}
     />
   );
 }
@@ -494,6 +549,8 @@ export default function App() {
   const [thumbnailDocument, setThumbnailDocument] = useState<pdfjs.PDFDocumentProxy | null>(null);
   const openInputRef = useRef<HTMLInputElement>(null);
   const mergeInputRef = useRef<HTMLInputElement>(null);
+  const stageScrollRef = useRef<HTMLDivElement>(null);
+  const pageWheelLockRef = useRef(false);
   const [undoCount, setUndoCount] = useState(0);
   const [redoCount, setRedoCount] = useState(0);
   const historyRef = useRef<EditSnapshot[]>([]);
@@ -567,6 +624,16 @@ export default function App() {
   const currentPage = currentPageIndex >= 0 ? pages[currentPageIndex] : null;
   const currentAnnotations = currentPage ? annotations[currentPage.id] ?? [] : [];
   const selectedAnnotation = currentAnnotations.find((annotation) => annotation.id === selectedAnnotationId) ?? null;
+
+  useEffect(() => {
+    if (stageScrollRef.current) stageScrollRef.current.scrollTop = 0;
+  }, [selectedPageId]);
+
+  const goToPage = (index: number) => {
+    if (index < 0 || index >= pages.length) return;
+    setSelectedPageId(pages[index].id);
+    setSelectedAnnotationId(null);
+  };
 
   const reportRenderError = useCallback((message: string) => setError(message), []);
 
@@ -1089,9 +1156,9 @@ export default function App() {
                 <div className="toolbar-right">
                   <button className="icon-button mobile-inspector-toggle" onClick={() => setInspectorOpen(true)} aria-label="Open edit panel" title="Open edit panel"><PanelRight size={16} /></button>
                   <span className="page-indicator">
-                    <button className="icon-button mini" disabled={currentPageIndex <= 0} onClick={() => setSelectedPageId(pages[currentPageIndex - 1]?.id ?? null)} aria-label="Previous page"><ChevronLeft size={16} /></button>
+                    <button className="icon-button mini" disabled={currentPageIndex <= 0} onClick={() => goToPage(currentPageIndex - 1)} aria-label="Previous page"><ChevronLeft size={16} /></button>
                     <b>{currentPageIndex + 1}</b><span>/</span>{pages.length}
-                    <button className="icon-button mini" disabled={currentPageIndex >= pages.length - 1} onClick={() => setSelectedPageId(pages[currentPageIndex + 1]?.id ?? null)} aria-label="Next page"><ChevronRight size={16} /></button>
+                    <button className="icon-button mini" disabled={currentPageIndex >= pages.length - 1} onClick={() => goToPage(currentPageIndex + 1)} aria-label="Next page"><ChevronRight size={16} /></button>
                   </span>
                   <span className="toolbar-separator" />
                   <button className="icon-button mini" onClick={() => setZoom((value) => Math.max(0.4, Math.round((value - 0.1) * 100) / 100))} aria-label="Zoom out"><ZoomOut size={16} /></button>
@@ -1105,7 +1172,25 @@ export default function App() {
 
               {currentPage ? (
                 <div className="page-stage">
-                  <div className="stage-scroll">
+                  <div
+                    className="stage-scroll"
+                    ref={stageScrollRef}
+                    onWheel={(event) => {
+                      if (Math.abs(event.deltaY) <= Math.abs(event.deltaX) || Math.abs(event.deltaY) < 8 || pageWheelLockRef.current) return;
+                      const element = event.currentTarget;
+                      const atTop = element.scrollTop <= 2;
+                      const atBottom = element.scrollTop + element.clientHeight >= element.scrollHeight - 2;
+                      const shouldGoPrevious = event.deltaY < 0 && atTop && currentPageIndex > 0;
+                      const shouldGoNext = event.deltaY > 0 && atBottom && currentPageIndex < pages.length - 1;
+                      if (!shouldGoPrevious && !shouldGoNext) return;
+                      event.preventDefault();
+                      pageWheelLockRef.current = true;
+                      goToPage(currentPageIndex + (shouldGoNext ? 1 : -1));
+                      window.setTimeout(() => {
+                        pageWheelLockRef.current = false;
+                      }, 550);
+                    }}
+                  >
                     <div className="stage-content">
                       <div className="stage-page-caption">
                         <span>{getPageLabel(currentPageIndex, pages.length)}</span>

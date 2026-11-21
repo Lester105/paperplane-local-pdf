@@ -2,6 +2,7 @@ import {
   ArrowDown,
   ArrowRight,
   ArrowUp,
+  Bold,
   Check,
   ChevronDown,
   ChevronLeft,
@@ -15,6 +16,7 @@ import {
   FileText,
   Highlighter,
   Info,
+  Italic,
   LoaderCircle,
   MousePointer2,
   MoveUpRight,
@@ -38,26 +40,34 @@ import {
   type PointerEvent,
   useCallback,
   useEffect,
-  useMemo,
   useRef,
   useState,
 } from "react";
 import * as pdfjs from "pdfjs-dist";
 import { createPageItems, exportPdf, fileStem, mergePdfs, readPdfPageCount, validatePdfFile } from "./lib/pdf";
-import { loadDraft, saveDraft } from "./lib/storage";
+import {
+  moveAnnotation,
+  isAnnotationDrag,
+  constrainTextDragDelta,
+  resizeHighlightAnnotation,
+  resizeTextAnnotation,
+  type HighlightResizeHandle,
+} from "./lib/annotations";
+import { findMostVisiblePage } from "./lib/page-visibility";
 import type {
   Annotation,
   AnnotationMap,
-  DraftSnapshot,
   FontName,
   PageItem,
   PenAnnotation,
+  TextAnnotation,
   ToolMode,
 } from "./types";
 
 type RenderedSize = { width: number; height: number };
+type ResizeBounds = { width: number; height: number };
 type Point = { x: number; y: number };
-type HighlightHandle = "left" | "right" | "top" | "bottom" | "top-left" | "top-right" | "bottom-left" | "bottom-right";
+type HighlightHandle = HighlightResizeHandle;
 type EditSnapshot = {
   pages: PageItem[];
   annotations: AnnotationMap;
@@ -99,7 +109,7 @@ function cloneSnapshot(snapshot: EditSnapshot): EditSnapshot {
 }
 
 function Viewer({
-  bytes,
+  document,
   page,
   annotations,
   zoom,
@@ -108,13 +118,22 @@ function Viewer({
   onHighlightStart,
   onHighlightDrag,
   onSelectAnnotation,
+  editingTextId,
+  onStartTextEditing,
+  onTextChange,
+  onFinishTextEditing,
+  onAnnotationDragStart,
+  onAnnotationDrag,
+  movingTextId,
   onHighlightResizeStart,
   onHighlightResize,
+  onTextResizeStart,
+  onTextResize,
   onPenCommit,
   selectedAnnotationId,
   onRenderError,
 }: {
-  bytes: Uint8Array;
+  document: pdfjs.PDFDocumentProxy | null;
   page: PageItem;
   annotations: Annotation[];
   zoom: number;
@@ -123,56 +142,84 @@ function Viewer({
   onHighlightStart: (point: Point) => string;
   onHighlightDrag: (id: string, start: Point, end: Point) => void;
   onSelectAnnotation: (id: string) => void;
+  editingTextId: string | null;
+  onStartTextEditing: (id: string) => void;
+  onTextChange: (id: string, text: string) => void;
+  onFinishTextEditing: (id: string) => void;
+  onAnnotationDragStart: (id: string, point: Point) => void;
+  onAnnotationDrag: (id: string, point: Point, shiftKey: boolean) => void;
+  movingTextId: string | null;
   onHighlightResizeStart: (id: string, point: Point, handle: HighlightHandle) => void;
   onHighlightResize: (id: string, point: Point) => void;
+  onTextResizeStart: (id: string, point: Point, handle: HighlightHandle, bounds: ResizeBounds) => void;
+  onTextResize: (id: string, point: Point) => void;
   onPenCommit: (points: Point[]) => void;
   selectedAnnotationId: string | null;
   onRenderError: (message: string) => void;
 }) {
+  const shellRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [document, setDocument] = useState<pdfjs.PDFDocumentProxy | null>(null);
+  const textEditorRef = useRef<HTMLTextAreaElement>(null);
   const [size, setSize] = useState<RenderedSize | null>(null);
-  const [rendering, setRendering] = useState(true);
+  const [rendering, setRendering] = useState(false);
+  const [inRange, setInRange] = useState(false);
   const [penPreview, setPenPreview] = useState<Point[] | null>(null);
   const highlightDrag = useRef<{ id: string; start: Point } | null>(null);
+  const annotationDrag = useRef<{ id: string; start: Point; moved: boolean } | null>(null);
+  const suppressTextClickRef = useRef<{ id: string; timer: number } | null>(null);
 
   useEffect(() => {
-    let active = true;
-    const loadingTask = pdfjs.getDocument({ data: bytes.slice() });
-    loadingTask.promise
-      .then((loadedDocument) => {
-        if (active) setDocument(loadedDocument);
-        else void loadedDocument.destroy();
-      })
-      .catch((cause: unknown) => {
-        if (active) onRenderError(cause instanceof Error ? cause.message : "The PDF could not be opened.");
-      });
-    return () => {
-      active = false;
-      void loadingTask.destroy();
-    };
-  }, [bytes, onRenderError]);
+    const shell = shellRef.current;
+    if (!shell) return;
+    if (typeof IntersectionObserver === "undefined") {
+      setInRange(true);
+      return;
+    }
+
+    const observer = new IntersectionObserver(([entry]) => {
+      setInRange(entry.isIntersecting);
+    }, { root: shell.closest(".stage-scroll"), rootMargin: "600px 0px" });
+    observer.observe(shell);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
-    if (!document || !canvasRef.current) return;
+    if (!editingTextId || !textEditorRef.current) return;
+    textEditorRef.current.focus();
+    const length = textEditorRef.current.value.length;
+    textEditorRef.current.setSelectionRange(length, length);
+  }, [editingTextId]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!document || !canvas) return;
     let active = true;
     let renderTask: pdfjs.RenderTask | null = null;
-    setRendering(true);
+    if (inRange) {
+      setRendering(true);
+    } else {
+      canvas.width = 0;
+      canvas.height = 0;
+      setRendering(false);
+    }
     document
       .getPage(page.sourceIndex + 1)
       .then((pdfPage) => {
-        if (!active || !canvasRef.current) return;
+        if (!active) return;
         const rotation = ((pdfPage.rotate + page.rotation) % 360 + 360) % 360;
         const viewport = pdfPage.getViewport({ scale: zoom, rotation });
-        const canvas = canvasRef.current;
+        setSize({ width: viewport.width, height: viewport.height });
+        canvas.style.width = `${viewport.width}px`;
+        canvas.style.height = `${viewport.height}px`;
+        if (!inRange) {
+          setRendering(false);
+          return;
+        }
         const context = canvas.getContext("2d", { alpha: false });
         if (!context) throw new Error("This browser could not create a PDF canvas.");
         const outputScale = window.devicePixelRatio || 1;
         canvas.width = Math.ceil(viewport.width * outputScale);
         canvas.height = Math.ceil(viewport.height * outputScale);
-        canvas.style.width = `${viewport.width}px`;
-        canvas.style.height = `${viewport.height}px`;
-        setSize({ width: viewport.width, height: viewport.height });
         renderTask = pdfPage.render({
           canvasContext: context,
           viewport,
@@ -192,7 +239,7 @@ function Viewer({
       active = false;
       renderTask?.cancel();
     };
-  }, [document, page, zoom, onRenderError]);
+  }, [document, page.sourceIndex, page.rotation, zoom, inRange, onRenderError]);
 
   const getPoint = (event: PointerEvent<HTMLDivElement>): Point => {
     const rect = event.currentTarget.getBoundingClientRect();
@@ -220,8 +267,21 @@ function Viewer({
       onHighlightDrag(highlightDrag.current.id, highlightDrag.current.start, getPoint(event));
       return;
     }
+    if (annotationDrag.current) {
+      const current = getPoint(event);
+      const bounds = event.currentTarget.getBoundingClientRect();
+      const dx = (current.x - annotationDrag.current.start.x) * bounds.width;
+      const dy = (current.y - annotationDrag.current.start.y) * bounds.height;
+      if (!annotationDrag.current.moved && !isAnnotationDrag(dx, dy)) return;
+      if (!annotationDrag.current.moved) {
+        annotationDrag.current.moved = true;
+      }
+      onAnnotationDrag(annotationDrag.current.id, current, event.shiftKey);
+      return;
+    }
     if (!penPreview) return;
-    setPenPreview((current) => (current ? [...current, getPoint(event)] : null));
+    const point = getPoint(event);
+    setPenPreview((current) => (current ? [...current, point] : null));
   };
 
   const handlePointerUp = () => {
@@ -229,15 +289,54 @@ function Viewer({
       highlightDrag.current = null;
       return;
     }
+    if (annotationDrag.current?.moved) {
+      const id = annotationDrag.current.id;
+      if (suppressTextClickRef.current) window.clearTimeout(suppressTextClickRef.current.timer);
+      const timer = window.setTimeout(() => {
+        if (suppressTextClickRef.current?.id === id) suppressTextClickRef.current = null;
+      }, 200);
+      suppressTextClickRef.current = { id, timer };
+    }
+    annotationDrag.current = null;
     if (penPreview && penPreview.length > 1) onPenCommit(penPreview);
     setPenPreview(null);
   };
 
   const penAnnotations = annotations.filter((annotation) => annotation.type === "pen");
   const overlayStyle = size ? { width: size.width, height: size.height } : undefined;
+  const beginAnnotationDrag = (id: string, event: {
+    pointerId: number;
+    clientX: number;
+    clientY: number;
+    currentTarget: Element;
+  }) => {
+    if (suppressTextClickRef.current) {
+      window.clearTimeout(suppressTextClickRef.current.timer);
+      suppressTextClickRef.current = null;
+    }
+    if (tool !== "select") return;
+    const layer = event.currentTarget.closest(".annotation-layer") as HTMLDivElement | null;
+    if (!layer) return;
+    layer.setPointerCapture(event.pointerId);
+    const rect = layer.getBoundingClientRect();
+    const point = {
+      x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
+      y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)),
+    };
+    annotationDrag.current = { id, start: point, moved: false };
+    onSelectAnnotation(id);
+    onAnnotationDragStart(id, point);
+  };
+
+  const shouldStartTextEditing = (id: string) => {
+    if (suppressTextClickRef.current?.id !== id) return true;
+    window.clearTimeout(suppressTextClickRef.current.timer);
+    suppressTextClickRef.current = null;
+    return false;
+  };
 
   return (
-    <div className="viewer-shell">
+    <div ref={shellRef} className="viewer-shell">
       {rendering && (
         <div className="rendering-indicator">
           <LoaderCircle size={16} className="spin" /> Rendering page…
@@ -247,15 +346,48 @@ function Viewer({
         <canvas ref={canvasRef} className="pdf-canvas" />
         {size && (
           <div
-            className={`annotation-layer tool-${tool}`}
+            className={`annotation-layer tool-${tool}${movingTextId ? " move-text" : ""}`}
             style={overlayStyle}
             onClick={(event) => {
-              if (tool !== "text") return;
+              const textAnnotationElement = event.target instanceof Element
+                ? event.target.closest<HTMLElement>("[data-text-annotation-id]")
+                : null;
+              if (textAnnotationElement) {
+                const annotationId = textAnnotationElement.dataset.textAnnotationId;
+                if (annotationId) {
+                  onSelectAnnotation(annotationId);
+                  const target = event.target instanceof Element ? event.target : null;
+                  if (target?.closest(".annotation-resize-handle")) return;
+                  if (tool === "text"
+                    && target?.closest(".text-annotation-content")
+                    && shouldStartTextEditing(annotationId)) {
+                    onStartTextEditing(annotationId);
+                  }
+                }
+                return;
+              }
+              if (tool !== "text") {
+                if (editingTextId) onFinishTextEditing(editingTextId);
+                return;
+              }
               const rect = event.currentTarget.getBoundingClientRect();
               onPlaceAnnotation({
                 x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
                 y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)),
               });
+            }}
+            onDoubleClick={(event) => {
+              const target = event.target instanceof Element ? event.target : null;
+              const textAnnotationElement = target?.closest<HTMLElement>("[data-text-annotation-id]");
+              const textContent = target?.closest(".text-annotation-content");
+              const annotationId = textAnnotationElement?.dataset.textAnnotationId;
+              if (!annotationId || !textContent
+                || target?.closest(".annotation-resize-handle")
+                || target?.closest(".inline-text-editor")) return;
+              onSelectAnnotation(annotationId);
+              if (tool === "select" && shouldStartTextEditing(annotationId)) {
+                onStartTextEditing(annotationId);
+              }
             }}
             onPointerDown={handlePointerDown}
             onPointerMove={handlePointerMove}
@@ -274,21 +406,95 @@ function Viewer({
                 return (
                   <div
                     key={annotation.id}
-                    className={`text-annotation${isSelected ? " selected" : ""}`}
+                    className={`text-annotation${isSelected ? " selected" : ""}${movingTextId === annotation.id ? " move-active" : ""}`}
+                    data-text-annotation-id={annotation.id}
                     style={{
                       left: `${annotation.x * 100}%`,
                       top: `${annotation.y * 100}%`,
                       fontSize: `${annotation.fontSize * zoom}px`,
                       color: annotation.color,
                       fontFamily,
+                      fontWeight: annotation.bold ? 700 : 400,
+                      fontStyle: annotation.italic ? "italic" : "normal",
+                      maxWidth: annotation.boxWidth !== undefined ? "100%" : undefined,
+                      ...(annotation.boxWidth !== undefined ? { width: `${annotation.boxWidth * 100}%` } : {}),
+                      ...(annotation.boxHeight !== undefined ? { height: `${annotation.boxHeight * 100}%` } : {}),
                     }}
                     onClick={(event) => {
                       event.stopPropagation();
                       onSelectAnnotation(annotation.id);
+                      const target = event.target instanceof Element ? event.target : null;
+                      if (tool === "text"
+                        && target?.closest(".text-annotation-content")
+                        && !target.closest(".annotation-resize-handle")
+                        && shouldStartTextEditing(annotation.id)) {
+                        onStartTextEditing(annotation.id);
+                      }
                     }}
-                    onPointerDown={(event) => event.stopPropagation()}
+                    onDoubleClick={(event) => {
+                      event.stopPropagation();
+                      const target = event.target instanceof Element ? event.target : null;
+                      if (target?.closest(".annotation-resize-handle") || target?.closest(".inline-text-editor")) return;
+                      onSelectAnnotation(annotation.id);
+                      if (tool === "select"
+                        && target?.closest(".text-annotation-content")
+                        && !target.closest(".annotation-resize-handle")
+                        && !target.closest(".inline-text-editor")
+                        && shouldStartTextEditing(annotation.id)) {
+                        onStartTextEditing(annotation.id);
+                      }
+                    }}
+                    onPointerDown={(event) => {
+                      event.stopPropagation();
+                      beginAnnotationDrag(annotation.id, event);
+                    }}
                   >
-                    {annotation.text || "Text"}
+                    {editingTextId === annotation.id ? (
+                      <textarea
+                        ref={textEditorRef}
+                        className="inline-text-editor"
+                        aria-label="Edit text annotation"
+                        value={annotation.text}
+                        rows={Math.min(20, Math.max(1, annotation.text.split("\n").length))}
+                        cols={Math.min(48, Math.max(4, ...annotation.text.split("\n").map((line) => line.length)))}
+                        style={{
+                          width: annotation.boxWidth !== undefined ? "100%" : undefined,
+                          height: annotation.boxHeight !== undefined ? "100%" : undefined,
+                        }}
+                        onChange={(event) => onTextChange(annotation.id, event.target.value)}
+                        onClick={(event) => event.stopPropagation()}
+                        onBlur={() => onFinishTextEditing(annotation.id)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Escape") {
+                            event.preventDefault();
+                            onFinishTextEditing(annotation.id);
+                            event.currentTarget.blur();
+                          }
+                        }}
+                        onPointerDown={(event) => event.stopPropagation()}
+                      />
+                    ) : (
+                      <span
+                        className="text-annotation-content"
+                      >
+                        {annotation.text || "Text"}
+                      </span>
+                    )}
+                    {isSelected && tool === "select" && (
+                      <>
+                        {(["left", "right", "top", "bottom", "top-left", "top-right", "bottom-left", "bottom-right"] as const).map((position) => (
+                          <ResizeHandle
+                            key={position}
+                            shape="text"
+                            position={position}
+                            width={annotation.boxWidth}
+                            height={annotation.boxHeight}
+                            onResizeStart={(point, bounds) => onTextResizeStart(annotation.id, point, position, bounds)}
+                            onResize={(point) => onTextResize(annotation.id, point)}
+                          />
+                        ))}
+                      </>
+                    )}
                   </div>
                 );
               }
@@ -302,18 +508,23 @@ function Viewer({
                     width: `${annotation.width * 100}%`,
                     height: `${annotation.height * 100}%`,
                     backgroundColor: annotation.color,
+                    opacity: annotation.opacity ?? 0.35,
                   }}
                   onClick={(event) => {
                     event.stopPropagation();
                     onSelectAnnotation(annotation.id);
                   }}
-                  onPointerDown={(event) => event.stopPropagation()}
+                  onPointerDown={(event) => {
+                    event.stopPropagation();
+                    beginAnnotationDrag(annotation.id, event);
+                  }}
                 >
                   {isSelected && (
                     <>
                       {(["left", "right", "top", "bottom", "top-left", "top-right", "bottom-left", "bottom-right"] as const).map((position) => (
                         <ResizeHandle
                           key={position}
+                          shape="highlight"
                           position={position}
                           width={annotation.width}
                           height={annotation.height}
@@ -327,17 +538,37 @@ function Viewer({
               );
             })}
             <svg className="pen-layer" viewBox="0 0 1000 1000" preserveAspectRatio="none">
-              {penAnnotations.map((annotation) => (
-                <polyline
-                  key={annotation.id}
-                  points={annotation.points.map((point) => `${point.x * 1000},${point.y * 1000}`).join(" ")}
-                  fill="none"
-                  stroke={annotation.color}
-                  strokeWidth={size ? (annotation.thickness / size.width) * 1000 : 3}
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-              ))}
+              {penAnnotations.map((annotation) => {
+                const points = annotation.points.map((point) => `${point.x * 1000},${point.y * 1000}`).join(" ");
+                const strokeWidth = size ? (annotation.thickness / size.width) * 1000 : 3;
+                return (
+                  <g key={annotation.id}>
+                    <polyline
+                      points={points}
+                      fill="none"
+                      stroke={annotation.color}
+                      strokeWidth={strokeWidth}
+                      strokeOpacity={annotation.opacity ?? 0.88}
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      pointerEvents="none"
+                    />
+                    <polyline
+                      points={points}
+                      fill="none"
+                      stroke="transparent"
+                      strokeWidth={size ? (Math.max(12, annotation.thickness) / size.width) * 1000 : 12}
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      pointerEvents={tool === "select" ? "stroke" : "none"}
+                      onPointerDown={(event) => {
+                        event.stopPropagation();
+                        beginAnnotationDrag(annotation.id, event);
+                      }}
+                    />
+                  </g>
+                );
+              })}
               {penPreview && (
                 <polyline
                   points={penPreview.map((point) => `${point.x * 1000},${point.y * 1000}`).join(" ")}
@@ -357,40 +588,60 @@ function Viewer({
 }
 
 function ResizeHandle({
+  shape,
   position,
   width,
   height,
   onResizeStart,
   onResize,
 }: {
+  shape: "highlight" | "text";
   position: HighlightHandle;
-  width: number;
-  height: number;
-  onResizeStart: (point: Point) => void;
+  width?: number;
+  height?: number;
+  onResizeStart: (point: Point, bounds: ResizeBounds) => void;
   onResize: (point: Point) => void;
 }) {
+  const activePointerId = useRef<number | null>(null);
+
+  const finishResize = (event: PointerEvent<HTMLSpanElement>) => {
+    if (activePointerId.current !== event.pointerId) return;
+    activePointerId.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
+
   return (
     <span
-      className={`highlight-resize-handle handle-${position}`}
+      className={`annotation-resize-handle ${shape}-resize-handle handle-${position}`}
       role="slider"
       tabIndex={0}
-      aria-label={`Resize highlight ${position}`}
-      aria-valuemin={1}
+      aria-label={`Resize ${shape} ${position}`}
+      aria-valuemin={0}
       aria-valuemax={100}
-      aria-valuenow={Math.round((position.includes("left") || position.includes("right") ? width : height) * 100)}
+      aria-valuenow={Math.round((position.includes("left") || position.includes("right") ? width ?? 0 : height ?? 0) * 100)}
+      onClick={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      }}
       onPointerDown={(event) => {
         event.stopPropagation();
-        event.currentTarget.setPointerCapture(event.pointerId);
+        event.preventDefault();
         const layer = event.currentTarget.closest(".annotation-layer");
-        if (!layer) return;
+        const shapeRect = event.currentTarget.parentElement?.getBoundingClientRect();
+        if (!layer || !shapeRect) return;
         const rect = layer.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return;
+        activePointerId.current = event.pointerId;
+        event.currentTarget.setPointerCapture(event.pointerId);
         onResizeStart({
           x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
           y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)),
-        });
+        }, { width: shapeRect.width / rect.width, height: shapeRect.height / rect.height });
       }}
       onPointerMove={(event) => {
-        if (!event.currentTarget.hasPointerCapture(event.pointerId)) return;
+        if (activePointerId.current !== event.pointerId) return;
         const layer = event.currentTarget.closest(".annotation-layer");
         if (!layer) return;
         const rect = layer.getBoundingClientRect();
@@ -399,6 +650,9 @@ function ResizeHandle({
           y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)),
         });
       }}
+      onPointerUp={finishResize}
+      onPointerCancel={finishResize}
+      onLostPointerCapture={finishResize}
     />
   );
 }
@@ -483,17 +737,20 @@ export default function App() {
   const [annotations, setAnnotations] = useState<AnnotationMap>(EMPTY_ANNOTATIONS);
   const [selectedPageId, setSelectedPageId] = useState<string | null>(null);
   const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
+  const [editingTextId, setEditingTextId] = useState<string | null>(null);
+  const [movingTextId, setMovingTextId] = useState<string | null>(null);
   const [tool, setTool] = useState<ToolMode>("select");
   const [zoom, setZoom] = useState(0.9);
-  const [localSaveState, setLocalSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [ready, setReady] = useState(false);
   const [rightPanel, setRightPanel] = useState<"properties" | "tools">("properties");
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [thumbnailDocument, setThumbnailDocument] = useState<pdfjs.PDFDocumentProxy | null>(null);
   const openInputRef = useRef<HTMLInputElement>(null);
   const mergeInputRef = useRef<HTMLInputElement>(null);
+  const stageScrollRef = useRef<HTMLDivElement>(null);
+  const scrollToPageRef = useRef<string | null>(null);
+  const scrollFrameRef = useRef<number | null>(null);
   const [undoCount, setUndoCount] = useState(0);
   const [redoCount, setRedoCount] = useState(0);
   const historyRef = useRef<EditSnapshot[]>([]);
@@ -506,13 +763,22 @@ export default function App() {
   });
   const highlightResizeRef = useRef<{
     id: string;
+    pageId: string;
     handle: HighlightHandle;
     point: Point;
-    x: number;
-    y: number;
-    width: number;
-    height: number;
+    highlight: Extract<Annotation, { type: "highlight" }>;
   } | null>(null);
+  const textResizeRef = useRef<{
+    id: string;
+    pageId: string;
+    handle: HighlightHandle;
+    point: Point;
+    annotation: TextAnnotation;
+    initialWidth: number;
+    initialHeight: number;
+    undoRecorded: boolean;
+  } | null>(null);
+  const textEditRef = useRef<{ id: string; pageId: string; undoRecorded: boolean } | null>(null);
   editorStateRef.current = { pages, annotations, selectedPageId, selectedAnnotationId };
 
   const recordUndo = () => {
@@ -537,14 +803,19 @@ export default function App() {
     const previous = historyRef.current.pop();
     if (!previous) return;
     redoHistoryRef.current = [...redoHistoryRef.current, cloneSnapshot(editorStateRef.current)];
+    textEditRef.current = null;
+    setEditingTextId(null);
+    setMovingTextId(null);
+    const restoredPageId = previous.selectedPageId && previous.pages.some((page) => page.id === previous.selectedPageId)
+      ? previous.selectedPageId
+      : previous.pages[0]?.id ?? null;
     setPages(previous.pages);
     setAnnotations(previous.annotations);
     editorStateRef.current = previous;
     setUndoCount(historyRef.current.length);
     setRedoCount(redoHistoryRef.current.length);
-    setSelectedPageId(previous.selectedPageId && previous.pages.some((page) => page.id === previous.selectedPageId)
-      ? previous.selectedPageId
-      : previous.pages[0]?.id ?? null);
+    scrollToPageRef.current = restoredPageId;
+    setSelectedPageId(restoredPageId);
     setSelectedAnnotationId(previous.selectedAnnotationId);
   }, []);
 
@@ -552,14 +823,19 @@ export default function App() {
     const next = redoHistoryRef.current.pop();
     if (!next) return;
     historyRef.current = [...historyRef.current, cloneSnapshot(editorStateRef.current)].slice(-50);
+    textEditRef.current = null;
+    setEditingTextId(null);
+    setMovingTextId(null);
+    const restoredPageId = next.selectedPageId && next.pages.some((page) => page.id === next.selectedPageId)
+      ? next.selectedPageId
+      : next.pages[0]?.id ?? null;
     setPages(next.pages);
     setAnnotations(next.annotations);
     editorStateRef.current = next;
     setUndoCount(historyRef.current.length);
     setRedoCount(redoHistoryRef.current.length);
-    setSelectedPageId(next.selectedPageId && next.pages.some((page) => page.id === next.selectedPageId)
-      ? next.selectedPageId
-      : next.pages[0]?.id ?? null);
+    scrollToPageRef.current = restoredPageId;
+    setSelectedPageId(restoredPageId);
     setSelectedAnnotationId(next.selectedAnnotationId);
   }, []);
 
@@ -567,6 +843,53 @@ export default function App() {
   const currentPage = currentPageIndex >= 0 ? pages[currentPageIndex] : null;
   const currentAnnotations = currentPage ? annotations[currentPage.id] ?? [] : [];
   const selectedAnnotation = currentAnnotations.find((annotation) => annotation.id === selectedAnnotationId) ?? null;
+
+  const navigateToPage = (pageId: string | null) => {
+    if (!pageId) return;
+    scrollToPageRef.current = pageId;
+    setSelectedPageId(pageId);
+    setSelectedAnnotationId(null);
+    setEditingTextId(null);
+    setMovingTextId(null);
+    textEditRef.current = null;
+  };
+
+  useEffect(() => {
+    const pageId = scrollToPageRef.current;
+    if (!pageId) return;
+    document.getElementById(`page-${pageId}`)?.scrollIntoView({ block: "start", behavior: "smooth" });
+    scrollToPageRef.current = null;
+  }, [pages, selectedPageId]);
+
+  const handleStageScroll = () => {
+    if (scrollFrameRef.current !== null) return;
+    scrollFrameRef.current = window.requestAnimationFrame(() => {
+      scrollFrameRef.current = null;
+      const scroller = stageScrollRef.current;
+      if (!scroller) return;
+      const bounds = scroller.getBoundingClientRect();
+      const pageElements = Array.from(scroller.querySelectorAll<HTMLElement>("[data-page-id]"));
+      const pageId = findMostVisiblePage(
+        pageElements.map((element) => {
+          const rect = element.getBoundingClientRect();
+          return { id: element.dataset.pageId ?? "", top: rect.top, bottom: rect.bottom };
+        }),
+        bounds.top,
+        bounds.bottom,
+      );
+      if (pageId && pageId !== selectedPageId) {
+        setSelectedPageId(pageId);
+        setSelectedAnnotationId(null);
+        setEditingTextId(null);
+        setMovingTextId(null);
+        textEditRef.current = null;
+      }
+    });
+  };
+
+  useEffect(() => () => {
+    if (scrollFrameRef.current !== null) window.cancelAnimationFrame(scrollFrameRef.current);
+  }, []);
 
   const reportRenderError = useCallback((message: string) => setError(message), []);
 
@@ -581,7 +904,7 @@ export default function App() {
       } else if ((event.ctrlKey || event.metaKey) && key === "y" && redoHistoryRef.current.length > 0) {
         event.preventDefault();
         redoEdit();
-      } else if (key === "delete" && selectedAnnotation?.type === "highlight" && currentPage) {
+      } else if (key === "delete" && selectedAnnotation && currentPage) {
         event.preventDefault();
         recordUndo();
         setAnnotations((existing) => ({
@@ -594,57 +917,6 @@ export default function App() {
     window.addEventListener("keydown", handleUndoShortcut);
     return () => window.removeEventListener("keydown", handleUndoShortcut);
   }, [undoEdit, redoEdit, selectedAnnotation, currentPage]);
-
-  useEffect(() => {
-    let active = true;
-    loadDraft()
-      .then((draft) => {
-        if (!active) return;
-        if (draft) {
-          setSourceBytes(draft.sourceBytes);
-          setFileName(draft.fileName);
-          setPages(draft.pages);
-          setAnnotations(draft.annotations);
-          editorStateRef.current = {
-            pages: draft.pages,
-            annotations: draft.annotations,
-            selectedPageId: draft.pages[0]?.id ?? null,
-            selectedAnnotationId: null,
-          };
-          clearUndoHistory();
-          setSelectedPageId(draft.pages[0]?.id ?? null);
-          setLocalSaveState("saved");
-        }
-      })
-      .catch((cause: unknown) => {
-        if (active) setError(`Local draft storage is unavailable: ${cause instanceof Error ? cause.message : "unknown error"}`);
-      })
-      .finally(() => {
-        if (active) setReady(true);
-      });
-    return () => { active = false; };
-  }, []);
-
-  useEffect(() => {
-    if (!sourceBytes || !ready) return;
-    setLocalSaveState("saving");
-    const timer = window.setTimeout(() => {
-      const snapshot: DraftSnapshot = {
-        fileName,
-        sourceBytes,
-        pages,
-        annotations,
-        savedAt: Date.now(),
-      };
-      saveDraft(snapshot)
-        .then(() => setLocalSaveState("saved"))
-        .catch((cause: unknown) => {
-          setLocalSaveState("error");
-          setError(`Could not save your local draft: ${cause instanceof Error ? cause.message : "unknown error"}`);
-        });
-    }, 500);
-    return () => window.clearTimeout(timer);
-  }, [sourceBytes, fileName, pages, annotations, ready]);
 
   useEffect(() => {
     if (!sourceBytes) {
@@ -688,8 +960,11 @@ export default function App() {
         selectedAnnotationId: null,
       };
       clearUndoHistory();
+      scrollToPageRef.current = nextPages[0].id;
       setSelectedPageId(nextPages[0].id);
       setSelectedAnnotationId(null);
+      textEditRef.current = null;
+      setEditingTextId(null);
       setTool("select");
       setNotice("PDF opened. Your edits stay on this device.");
     } catch (cause) {
@@ -723,8 +998,11 @@ export default function App() {
       };
       clearUndoHistory();
       setFileName(`${fileStem(fileName)}-merged.pdf`);
+      scrollToPageRef.current = nextPages[0]?.id ?? null;
       setSelectedPageId(nextPages[0]?.id ?? null);
       setSelectedAnnotationId(null);
+      textEditRef.current = null;
+      setEditingTextId(null);
       setNotice(`${file.name} was added to the end of this document.`);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not merge this PDF.");
@@ -756,16 +1034,19 @@ export default function App() {
     }
   }, [annotations, currentPage, currentPageIndex, fileName, pages, sourceBytes]);
 
-  const updateCurrentAnnotations = (update: (existing: Annotation[]) => Annotation[]) => {
-    if (!currentPage) return;
+  const updateCurrentAnnotations = (
+    update: (existing: Annotation[]) => Annotation[],
+    pageId = currentPage?.id,
+  ) => {
+    if (!pageId) return;
     setAnnotations((existing) => ({
       ...existing,
-      [currentPage.id]: update(existing[currentPage.id] ?? []),
+      [pageId]: update(existing[pageId] ?? []),
     }));
   };
 
-  const addAnnotation = (point: Point) => {
-    if (!currentPage || tool !== "text") return;
+  const addAnnotation = (point: Point, pageId = currentPage?.id) => {
+    if (!pageId || tool !== "text") return;
     recordUndo();
     if (tool === "text") {
       const annotation: Annotation = {
@@ -777,15 +1058,20 @@ export default function App() {
         font: "Helvetica",
         fontSize: 16,
         color: "#20242b",
+        bold: false,
+        italic: false,
       };
-      updateCurrentAnnotations((existing) => [...existing, annotation]);
+      updateCurrentAnnotations((existing) => [...existing, annotation], pageId);
       setSelectedAnnotationId(annotation.id);
+      setEditingTextId(null);
+      textEditRef.current = null;
+      setTool("select");
       return;
     }
   };
 
-  const startHighlight = (point: Point): string => {
-    if (!currentPage) return "";
+  const startHighlight = (point: Point, pageId = currentPage?.id): string => {
+    if (!pageId) return "";
     recordUndo();
     const x = Math.min(point.x, 0.98);
     const y = Math.min(point.y, 0.965);
@@ -797,13 +1083,14 @@ export default function App() {
       width: Math.min(0.22, 1 - x),
       height: Math.min(0.035, 1 - y),
       color: "#ffdb66",
+      opacity: 0.35,
     };
-    updateCurrentAnnotations((existing) => [...existing, annotation]);
+    updateCurrentAnnotations((existing) => [...existing, annotation], pageId);
     setSelectedAnnotationId(annotation.id);
     return annotation.id;
   };
 
-  const dragHighlight = (id: string, start: Point, end: Point) => {
+  const dragHighlight = (id: string, start: Point, end: Point, pageId = currentPage?.id) => {
     const dx = end.x - start.x;
     const dy = end.y - start.y;
     const draggedHorizontally = Math.abs(dx) >= 0.005;
@@ -821,57 +1108,87 @@ export default function App() {
           height: Math.min(1 - Math.min(start.y, end.y), Math.max(0.015, Math.abs(dy))),
         }
         : {}),
-    }, false);
+    }, false, pageId);
   };
 
-  const startHighlightResize = (id: string, point: Point, handle: HighlightHandle) => {
-    const highlight = currentAnnotations.find(
+  const startHighlightResize = (id: string, point: Point, handle: HighlightHandle, pageId = currentPage?.id) => {
+    if (!pageId) return;
+    const highlight = (annotations[pageId] ?? []).find(
       (annotation) => annotation.id === id && annotation.type === "highlight",
     );
     if (!highlight || highlight.type !== "highlight") return;
     recordUndo();
     highlightResizeRef.current = {
       id,
+      pageId,
       handle,
       point,
-      x: highlight.x,
-      y: highlight.y,
-      width: highlight.width,
-      height: highlight.height,
+      highlight: { ...highlight },
     };
   };
 
   const resizeHighlight = (id: string, point: Point) => {
     const initial = highlightResizeRef.current;
     if (!initial || initial.id !== id) return;
-    const minWidth = 0.008;
-    const minHeight = 0.008;
-    let { x, y, width, height } = initial;
-    const dx = point.x - initial.point.x;
-    const dy = point.y - initial.point.y;
-    const movesLeft = initial.handle.includes("left");
-    const movesRight = initial.handle.includes("right");
-    const movesTop = initial.handle.includes("top");
-    const movesBottom = initial.handle.includes("bottom");
-
-    if (movesLeft) {
-      x = Math.max(0, Math.min(initial.x + initial.width - minWidth, initial.x + dx));
-      width = initial.x + initial.width - x;
-    } else if (movesRight) {
-      width = Math.max(minWidth, Math.min(1 - initial.x, initial.width + dx));
-    }
-
-    if (movesTop) {
-      y = Math.max(0, Math.min(initial.y + initial.height - minHeight, initial.y + dy));
-      height = initial.y + initial.height - y;
-    } else if (movesBottom) {
-      height = Math.max(minHeight, Math.min(1 - initial.y, initial.height + dy));
-    }
-
-    updateAnnotation(id, { x, y, width, height }, false);
+    const resized = resizeHighlightAnnotation(initial.highlight, initial.handle, initial.point, point);
+    updateAnnotation(id, {
+      x: resized.x,
+      y: resized.y,
+      width: resized.width,
+      height: resized.height,
+    }, false, initial.pageId);
   };
 
-  const addPenAnnotation = (points: Point[]) => {
+  const startTextResize = (
+    id: string,
+    point: Point,
+    handle: HighlightHandle,
+    bounds: ResizeBounds,
+    pageId = currentPage?.id,
+  ) => {
+    if (!pageId) return;
+    const annotation = (annotations[pageId] ?? []).find(
+      (item) => item.id === id && item.type === "text",
+    );
+    if (!annotation || annotation.type !== "text") return;
+    textResizeRef.current = {
+      id,
+      pageId,
+      handle,
+      point,
+      annotation: { ...annotation },
+      initialWidth: annotation.boxWidth ?? bounds.width,
+      initialHeight: annotation.boxHeight ?? bounds.height,
+      undoRecorded: false,
+    };
+  };
+
+  const resizeTextBox = (id: string, point: Point) => {
+    const initial = textResizeRef.current;
+    if (!initial || initial.id !== id) return;
+    const resized = resizeTextAnnotation(
+      initial.annotation,
+      initial.handle,
+      initial.point,
+      point,
+      initial.initialWidth,
+      initial.initialHeight,
+    );
+    const initialWidth = initial.annotation.boxWidth ?? initial.initialWidth;
+    const initialHeight = initial.annotation.boxHeight ?? initial.initialHeight;
+    if (resized.x === initial.annotation.x
+      && resized.y === initial.annotation.y
+      && resized.boxWidth === initialWidth
+      && resized.boxHeight === initialHeight) return;
+    if (!initial.undoRecorded) {
+      recordUndo();
+      initial.undoRecorded = true;
+    }
+    updateCurrentAnnotations((existing) => existing.map((item) => item.id === id ? resized : item), initial.pageId);
+  };
+
+  const addPenAnnotation = (points: Point[], pageId = currentPage?.id) => {
+    if (!pageId) return;
     recordUndo();
     const annotation: PenAnnotation = {
       id: crypto.randomUUID(),
@@ -881,14 +1198,82 @@ export default function App() {
       points,
       color: "#315ee8",
       thickness: 2.4,
+      opacity: 0.88,
     };
-    updateCurrentAnnotations((existing) => [...existing, annotation]);
+    updateCurrentAnnotations((existing) => [...existing, annotation], pageId);
     setSelectedAnnotationId(annotation.id);
   };
 
-  const updateAnnotation = (id: string, patch: Partial<Annotation>, saveUndo = true) => {
+  const updateAnnotation = (id: string, patch: Partial<Annotation>, saveUndo = true, pageId = currentPage?.id) => {
     if (saveUndo) recordUndo();
-    updateCurrentAnnotations((existing) => existing.map((item) => item.id === id ? { ...item, ...patch } as Annotation : item));
+    updateCurrentAnnotations((existing) => existing.map((item) => item.id === id ? { ...item, ...patch } as Annotation : item), pageId);
+  };
+
+  const startTextEditing = (id: string, pageId: string) => {
+    setSelectedPageId(pageId);
+    setSelectedAnnotationId(id);
+    setEditingTextId(id);
+    setMovingTextId(null);
+    textEditRef.current = { id, pageId, undoRecorded: false };
+  };
+
+  const updateTextAnnotation = (id: string, text: string, pageId = currentPage?.id) => {
+    if (!pageId) return;
+    let edit = textEditRef.current;
+    if (!edit || edit.id !== id || edit.pageId !== pageId) {
+      edit = { id, pageId, undoRecorded: false };
+      textEditRef.current = edit;
+    }
+    if (!edit.undoRecorded) {
+      recordUndo();
+      edit.undoRecorded = true;
+    }
+    updateAnnotation(id, { text }, false, pageId);
+  };
+
+  const finishTextEditing = (id: string) => {
+    if (textEditRef.current?.id === id) textEditRef.current = null;
+    setEditingTextId((current) => current === id ? null : current);
+  };
+
+  const annotationDragRef = useRef<{
+    id: string;
+    pageId: string;
+    start: Point;
+    annotation: Annotation;
+    undoRecorded: boolean;
+  } | null>(null);
+
+  const startAnnotationDrag = (id: string, point: Point, pageId = currentPage?.id) => {
+    if (!pageId) return;
+    const annotation = (annotations[pageId] ?? []).find((item) => item.id === id);
+    if (!annotation) return;
+    annotationDragRef.current = {
+      id,
+      pageId,
+      start: point,
+      annotation: annotation.type === "pen"
+        ? { ...annotation, points: annotation.points.map((item) => ({ ...item })) }
+        : { ...annotation },
+      undoRecorded: false,
+    };
+  };
+
+  const dragAnnotation = (id: string, point: Point, pageId = currentPage?.id, shiftKey = false) => {
+    const drag = annotationDragRef.current;
+    if (!drag || drag.id !== id) return;
+    const dx = point.x - drag.start.x;
+    const dy = point.y - drag.start.y;
+    if (!drag.undoRecorded && Math.hypot(dx, dy) < 0.002) return;
+    if (!drag.undoRecorded) {
+      recordUndo();
+      drag.undoRecorded = true;
+    }
+    const delta = drag.annotation.type === "text"
+      ? constrainTextDragDelta(dx, dy, shiftKey)
+      : { x: dx, y: dy };
+    const moved = moveAnnotation(drag.annotation, delta.x, delta.y);
+    updateCurrentAnnotations((existing) => existing.map((item) => item.id === id ? moved : item), pageId);
   };
 
   const deleteSelectedAnnotation = () => {
@@ -896,6 +1281,7 @@ export default function App() {
     recordUndo();
     updateCurrentAnnotations((existing) => existing.filter((item) => item.id !== selectedAnnotationId));
     setSelectedAnnotationId(null);
+    setMovingTextId(null);
   };
 
   const movePage = (index: number, offset: number) => {
@@ -929,8 +1315,11 @@ export default function App() {
       ...existing.slice(currentPageIndex + 1),
     ]);
     setAnnotations((existing) => ({ ...existing, [duplicate.id]: copiedAnnotations }));
+    scrollToPageRef.current = duplicate.id;
     setSelectedPageId(duplicate.id);
     setSelectedAnnotationId(null);
+    textEditRef.current = null;
+    setEditingTextId(null);
   };
 
   const deletePage = () => {
@@ -944,8 +1333,11 @@ export default function App() {
       delete next[currentPage.id];
       return next;
     });
+    scrollToPageRef.current = nextPages[nextIndex].id;
     setSelectedPageId(nextPages[nextIndex].id);
     setSelectedAnnotationId(null);
+    textEditRef.current = null;
+    setEditingTextId(null);
   };
 
   const handleDrop = (event: DragEvent<HTMLDivElement>) => {
@@ -955,13 +1347,6 @@ export default function App() {
   };
 
   const annotationFont = selectedAnnotation?.type === "text" ? selectedAnnotation.font : "Helvetica";
-
-  const localSaveLabel = useMemo(() => {
-    if (localSaveState === "saving") return "Saving on this device…";
-    if (localSaveState === "saved") return "Saved on this device";
-    if (localSaveState === "error") return "Local save failed";
-    return "Local-only workspace";
-  }, [localSaveState]);
 
   return (
     <div className="app-shell" onDragOver={(event) => event.preventDefault()} onDrop={handleDrop}>
@@ -979,11 +1364,6 @@ export default function App() {
           ) : <span className="product-label">PDF studio</span>}
         </div>
         <div className="topbar-actions">
-          <span className={`save-status save-${localSaveState}`}>
-            {localSaveState === "saving" ? <LoaderCircle size={14} className="spin" /> :
-              localSaveState === "saved" ? <Check size={14} /> : <ShieldCheck size={14} />}
-            {localSaveLabel}
-          </span>
           <button
             className="button button-outline undo-button"
             disabled={undoCount === 0}
@@ -1060,7 +1440,7 @@ export default function App() {
                     isActive={page.id === selectedPageId}
                     index={index}
                     total={pages.length}
-                    onClick={() => { setSelectedPageId(page.id); setSelectedAnnotationId(null); }}
+                    onClick={() => navigateToPage(page.id)}
                   />
                 ))}
               </div>
@@ -1076,22 +1456,22 @@ export default function App() {
                     <MousePointer2 size={16} /><span>Select</span>
                   </button>
                   <span className="toolbar-separator" />
-                  <button className={`tool-button${tool === "text" ? " active" : ""}`} onClick={() => setTool("text")} title="Add text">
+                  <button className={`tool-button${tool === "text" ? " active" : ""}`} onClick={() => { setMovingTextId(null); setTool("text"); }} title="Add text">
                     <Type size={16} /><span>Text</span>
                   </button>
-                  <button className={`tool-button${tool === "highlight" ? " active" : ""}`} onClick={() => setTool("highlight")} title="Highlight">
+                  <button className={`tool-button${tool === "highlight" ? " active" : ""}`} onClick={() => { setMovingTextId(null); setTool("highlight"); }} title="Highlight">
                     <Highlighter size={16} /><span>Highlight</span>
                   </button>
-                  <button className={`tool-button${tool === "draw" ? " active" : ""}`} onClick={() => setTool("draw")} title="Draw">
+                  <button className={`tool-button${tool === "draw" ? " active" : ""}`} onClick={() => { setMovingTextId(null); setTool("draw"); }} title="Draw">
                     <PenLine size={16} /><span>Draw</span>
                   </button>
                 </div>
                 <div className="toolbar-right">
                   <button className="icon-button mobile-inspector-toggle" onClick={() => setInspectorOpen(true)} aria-label="Open edit panel" title="Open edit panel"><PanelRight size={16} /></button>
                   <span className="page-indicator">
-                    <button className="icon-button mini" disabled={currentPageIndex <= 0} onClick={() => setSelectedPageId(pages[currentPageIndex - 1]?.id ?? null)} aria-label="Previous page"><ChevronLeft size={16} /></button>
+                    <button className="icon-button mini" disabled={currentPageIndex <= 0} onClick={() => navigateToPage(pages[currentPageIndex - 1]?.id ?? null)} aria-label="Previous page"><ChevronLeft size={16} /></button>
                     <b>{currentPageIndex + 1}</b><span>/</span>{pages.length}
-                    <button className="icon-button mini" disabled={currentPageIndex >= pages.length - 1} onClick={() => setSelectedPageId(pages[currentPageIndex + 1]?.id ?? null)} aria-label="Next page"><ChevronRight size={16} /></button>
+                    <button className="icon-button mini" disabled={currentPageIndex >= pages.length - 1} onClick={() => navigateToPage(pages[currentPageIndex + 1]?.id ?? null)} aria-label="Next page"><ChevronRight size={16} /></button>
                   </span>
                   <span className="toolbar-separator" />
                   <button className="icon-button mini" onClick={() => setZoom((value) => Math.max(0.4, Math.round((value - 0.1) * 100) / 100))} aria-label="Zoom out"><ZoomOut size={16} /></button>
@@ -1103,38 +1483,64 @@ export default function App() {
               {error && <div className="alert alert-error"><Info size={15} /><span>{error}</span><button aria-label="Dismiss error" onClick={() => setError("")}><X size={15} /></button></div>}
               {notice && !error && <div className="alert alert-success"><Check size={15} /><span>{notice}</span><button aria-label="Dismiss message" onClick={() => setNotice("")}><X size={15} /></button></div>}
 
-              {currentPage ? (
+              {pages.length > 0 ? (
                 <div className="page-stage">
-                  <div className="stage-scroll">
+                  <div ref={stageScrollRef} className="stage-scroll" onScroll={handleStageScroll}>
                     <div className="stage-content">
-                      <div className="stage-page-caption">
-                        <span>{getPageLabel(currentPageIndex, pages.length)}</span>
-                        {tool !== "select" && <span className="mode-hint">
-                          {tool === "text" ? "Click the page to place text" : tool === "highlight" ? "Click and drag to size a highlight" : "Draw on the page"}
-                        </span>}
-                      </div>
-                      <Viewer
-                        key={`${currentPage.id}-${currentPage.rotation}`}
-                        bytes={sourceBytes}
-                        page={currentPage}
-                        annotations={currentAnnotations}
-                        zoom={zoom}
-                        tool={tool}
-                        onPlaceAnnotation={addAnnotation}
-                        onHighlightStart={startHighlight}
-                        onHighlightDrag={dragHighlight}
-                        onSelectAnnotation={setSelectedAnnotationId}
-                        onHighlightResizeStart={startHighlightResize}
-                        onHighlightResize={resizeHighlight}
-                        onPenCommit={addPenAnnotation}
-                        selectedAnnotationId={selectedAnnotationId}
-                        onRenderError={reportRenderError}
-                      />
+                      {pages.map((page, index) => (
+                        <section key={page.id} id={`page-${page.id}`} className="continuous-page" data-page-id={page.id}>
+                          <div className="stage-page-caption">
+                            <span>{getPageLabel(index, pages.length)}</span>
+                            {tool !== "select" && <span className="mode-hint">
+                              {tool === "text" ? "Click the page to place text" : tool === "highlight" ? "Click and drag to size a highlight" : "Draw on the page"}
+                            </span>}
+                          </div>
+                          <Viewer
+                            key={`${page.id}-${page.rotation}`}
+                            document={thumbnailDocument}
+                            page={page}
+                            annotations={annotations[page.id] ?? []}
+                            zoom={zoom}
+                            tool={tool}
+                            onPlaceAnnotation={(point) => {
+                              setSelectedPageId(page.id);
+                              addAnnotation(point, page.id);
+                            }}
+                            onHighlightStart={(point) => {
+                              setSelectedPageId(page.id);
+                              return startHighlight(point, page.id);
+                            }}
+                            onHighlightDrag={(id, start, end) => dragHighlight(id, start, end, page.id)}
+                            onSelectAnnotation={(id) => {
+                              setSelectedPageId(page.id);
+                              setSelectedAnnotationId(id);
+                              setEditingTextId(null);
+                              setMovingTextId((current) => current === id ? current : null);
+                              textEditRef.current = null;
+                            }}
+                            movingTextId={page.id === selectedPageId ? movingTextId : null}
+                            editingTextId={page.id === selectedPageId ? editingTextId : null}
+                            onStartTextEditing={(id) => startTextEditing(id, page.id)}
+                            onTextChange={(id, text) => updateTextAnnotation(id, text, page.id)}
+                            onFinishTextEditing={finishTextEditing}
+                            onAnnotationDragStart={(id, point) => startAnnotationDrag(id, point, page.id)}
+                            onAnnotationDrag={(id, point, shiftKey) => dragAnnotation(id, point, page.id, shiftKey)}
+                            onTextResizeStart={(id, point, handle, bounds) => startTextResize(id, point, handle, bounds, page.id)}
+                            onTextResize={resizeTextBox}
+                            onHighlightResizeStart={(id, point, handle) => startHighlightResize(id, point, handle, page.id)}
+                            onHighlightResize={resizeHighlight}
+                            onPenCommit={(points) => {
+                              setSelectedPageId(page.id);
+                              addPenAnnotation(points, page.id);
+                            }}
+                            selectedAnnotationId={page.id === selectedPageId ? selectedAnnotationId : null}
+                            onRenderError={reportRenderError}
+                          />
+                        </section>
+                      ))}
                     </div>
                   </div>
                   <div className="stage-bottom">
-                    <span><span className="status-dot" /> Autosaved locally</span>
-                    <span className="stage-bottom-divider" />
                     <span>{fileName}</span>
                   </div>
                 </div>
@@ -1154,8 +1560,29 @@ export default function App() {
                   <div className="inspector-title"><h2>{selectedAnnotation ? "Edit markup" : "Page tools"}</h2><p>{selectedAnnotation ? "Adjust your selected annotation." : "Organize and export your pages."}</p></div>
                   {selectedAnnotation?.type === "text" ? (
                     <div className="property-section">
+                      <button
+                        type="button"
+                        className={`action-row text-move-control${movingTextId === selectedAnnotation.id ? " active" : ""}`}
+                        aria-pressed={movingTextId === selectedAnnotation.id}
+                        onClick={() => {
+                          const moveActive = movingTextId === selectedAnnotation.id;
+                          setTool("select");
+                          setEditingTextId(null);
+                          textEditRef.current = null;
+                          setMovingTextId(moveActive ? null : selectedAnnotation.id);
+                        }}
+                      >
+                        <MoveUpRight size={16} /><span>{movingTextId === selectedAnnotation.id ? "Move mode on" : "Move text box"}</span>
+                      </button>
+                      {movingTextId === selectedAnnotation.id && (
+                        <p className="resize-hint">Drag the selected box to move it. Hold Shift to constrain movement to one axis.</p>
+                      )}
                       <label className="field-label" htmlFor="text-content">Text</label>
-                      <textarea id="text-content" className="text-input" value={selectedAnnotation.text} onChange={(event) => updateAnnotation(selectedAnnotation.id, { text: event.target.value })} rows={3} />
+                      <textarea id="text-content" className="text-input" value={selectedAnnotation.text} onChange={(event) => updateTextAnnotation(selectedAnnotation.id, event.target.value)} rows={3} />
+                      <div className="field-row"><span className="field-label">Style</span><div className="text-style-buttons">
+                        <button type="button" className={selectedAnnotation.bold ? "active" : ""} aria-label="Bold text" aria-pressed={Boolean(selectedAnnotation.bold)} onClick={() => updateAnnotation(selectedAnnotation.id, { bold: !selectedAnnotation.bold })}><Bold size={15} /></button>
+                        <button type="button" className={selectedAnnotation.italic ? "active" : ""} aria-label="Italic text" aria-pressed={Boolean(selectedAnnotation.italic)} onClick={() => updateAnnotation(selectedAnnotation.id, { italic: !selectedAnnotation.italic })}><Italic size={15} /></button>
+                      </div></div>
                       <label className="field-label" htmlFor="font-family">Font family</label>
                       <div className="select-wrap"><select id="font-family" value={annotationFont} onChange={(event) => updateAnnotation(selectedAnnotation.id, { font: event.target.value as FontName })}>
                         <option value="Helvetica">Helvetica</option><option value="TimesRoman">Times New Roman</option><option value="Courier">Courier</option>
@@ -1170,12 +1597,18 @@ export default function App() {
                       <p className="selected-markup-info"><Highlighter size={16} /> Highlight</p>
                       <p className="resize-hint">Click and drag on the page, or drag any edge or corner handle to resize.</p>
                       <ColorPicker value={selectedAnnotation.color} onChange={(color) => updateAnnotation(selectedAnnotation.id, { color })} />
+                      <div className="field-row"><label className="field-label" htmlFor="highlight-opacity">Opacity</label><span className="field-value">{Math.round((selectedAnnotation.opacity ?? 0.35) * 100)}%</span></div>
+                      <input id="highlight-opacity" aria-label="Highlight opacity" type="range" min="10" max="100" step="1" value={Math.round((selectedAnnotation.opacity ?? 0.35) * 100)} onChange={(event) => updateAnnotation(selectedAnnotation.id, { opacity: Number(event.target.value) / 100 })} />
                       <button className="delete-markup" title="Delete selected highlight (Delete)" onClick={deleteSelectedAnnotation}><Trash2 size={15} /> Delete highlight <kbd>Delete</kbd></button>
                     </div>
                   ) : selectedAnnotation?.type === "pen" ? (
                     <div className="property-section">
                       <p className="selected-markup-info"><PenLine size={16} /> Freehand drawing</p>
                       <ColorPicker value={selectedAnnotation.color} onChange={(color) => updateAnnotation(selectedAnnotation.id, { color })} />
+                      <div className="field-row"><label className="field-label" htmlFor="pen-opacity">Opacity</label><span className="field-value">{Math.round((selectedAnnotation.opacity ?? 0.88) * 100)}%</span></div>
+                      <input id="pen-opacity" aria-label="Drawing opacity" type="range" min="10" max="100" step="1" value={Math.round((selectedAnnotation.opacity ?? 0.88) * 100)} onChange={(event) => updateAnnotation(selectedAnnotation.id, { opacity: Number(event.target.value) / 100 })} />
+                      <div className="field-row"><label className="field-label" htmlFor="pen-thickness">Stroke width</label><span className="field-value">{selectedAnnotation.thickness.toFixed(1)} px</span></div>
+                      <input id="pen-thickness" aria-label="Stroke width" type="range" min="1" max="12" step="0.5" value={selectedAnnotation.thickness} onChange={(event) => updateAnnotation(selectedAnnotation.id, { thickness: Number(event.target.value) })} />
                       <button className="delete-markup" onClick={deleteSelectedAnnotation}><Trash2 size={15} /> Remove drawing</button>
                     </div>
                   ) : (

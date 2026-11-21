@@ -6,6 +6,26 @@ import type { Annotation, AnnotationMap, FontName, PageItem } from "../types";
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
 export const MAX_PDF_SIZE = 100 * 1024 * 1024;
+const STANDARD_FONTS: Record<FontName, StandardFonts[]> = {
+  Helvetica: [
+    StandardFonts.Helvetica,
+    StandardFonts.HelveticaBold,
+    StandardFonts.HelveticaOblique,
+    StandardFonts.HelveticaBoldOblique,
+  ],
+  TimesRoman: [
+    StandardFonts.TimesRoman,
+    StandardFonts.TimesRomanBold,
+    StandardFonts.TimesRomanItalic,
+    StandardFonts.TimesRomanBoldItalic,
+  ],
+  Courier: [
+    StandardFonts.Courier,
+    StandardFonts.CourierBold,
+    StandardFonts.CourierOblique,
+    StandardFonts.CourierBoldOblique,
+  ],
+};
 
 export async function validatePdfFile(file: File): Promise<void> {
   if (!file.name.toLowerCase().endsWith(".pdf")) {
@@ -60,7 +80,7 @@ async function applyAnnotation(
   annotation: Annotation,
   page: ReturnType<PDFDocument["getPages"]>[number],
   viewport: pdfjs.PageViewport,
-  fontCache: Partial<Record<FontName, PDFFont>>,
+  fontCache: Partial<Record<string, PDFFont>>,
   pdfDocument: PDFDocument,
 ): Promise<void> {
   const x = annotation.x * viewport.width;
@@ -68,15 +88,13 @@ async function applyAnnotation(
   const color = parseHexColor(annotation.color);
 
   if (annotation.type === "text") {
-    const fontConstant = {
-      Helvetica: StandardFonts.Helvetica,
-      TimesRoman: StandardFonts.TimesRoman,
-      Courier: StandardFonts.Courier,
-    }[annotation.font];
-    let font = fontCache[annotation.font];
+    const fontIndex = (annotation.bold ? 1 : 0) + (annotation.italic ? 2 : 0);
+    const fontKey = `${annotation.font}:${fontIndex}`;
+    const fontConstant = STANDARD_FONTS[annotation.font][fontIndex];
+    let font = fontCache[fontKey];
     if (!font) {
       font = await pdfDocument.embedFont(fontConstant);
-      fontCache[annotation.font] = font;
+      fontCache[fontKey] = font;
     }
     const baseline = toPdfPoint(viewport, x, y + annotation.fontSize);
     page.drawText(annotation.text, {
@@ -85,6 +103,9 @@ async function applyAnnotation(
       size: annotation.fontSize,
       font,
       color,
+      ...(annotation.boxWidth !== undefined
+        ? { maxWidth: annotation.boxWidth * viewport.width, lineHeight: annotation.fontSize * 1.2 }
+        : {}),
     });
     return;
   }
@@ -108,7 +129,7 @@ async function applyAnnotation(
       width: Math.max(...xs) - Math.min(...xs),
       height: Math.max(...ys) - Math.min(...ys),
       color,
-      opacity: 0.35,
+      opacity: annotation.opacity ?? 0.35,
     });
     return;
   }
@@ -121,7 +142,7 @@ async function applyAnnotation(
       end: toPdfPoint(viewport, to.x * viewport.width, to.y * viewport.height),
       color,
       thickness: annotation.thickness,
-      opacity: 0.88,
+      opacity: annotation.opacity ?? 0.88,
     });
   }
 }
@@ -138,7 +159,7 @@ export async function exportPdf(
   const chosenPages = pages.filter((page) => !selectedPageIds || selectedPageIds.has(page.id));
   const sourceIndices = chosenPages.map((page) => page.sourceIndex);
   const copiedPages = await output.copyPages(source, sourceIndices);
-  const fontCache: Partial<Record<FontName, PDFFont>> = {};
+  const fontCache: Partial<Record<string, PDFFont>> = {};
 
   try {
     for (let index = 0; index < copiedPages.length; index += 1) {

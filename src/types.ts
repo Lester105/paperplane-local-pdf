@@ -19,6 +19,10 @@ export interface TextAnnotation extends PositionedAnnotation {
   font: FontName;
   fontSize: number;
   color: string;
+  bold?: boolean;
+  italic?: boolean;
+  boxWidth?: number;
+  boxHeight?: number;
 }
 
 export interface HighlightAnnotation extends PositionedAnnotation {
@@ -26,6 +30,7 @@ export interface HighlightAnnotation extends PositionedAnnotation {
   width: number;
   height: number;
   color: string;
+  opacity?: number;
 }
 
 export interface PenAnnotation extends PositionedAnnotation {
@@ -33,15 +38,8 @@ export interface PenAnnotation extends PositionedAnnotation {
   points: Array<{ x: number; y: number }>;
   color: string;
   thickness: number;
+  opacity?: number;
 }
 
 export type Annotation = TextAnnotation | HighlightAnnotation | PenAnnotation;
 export type AnnotationMap = Record<string, Annotation[]>;
-
-export interface DraftSnapshot {
-  fileName: string;
-  sourceBytes: Uint8Array;
-  pages: PageItem[];
-  annotations: AnnotationMap;
-  savedAt: number;
-}

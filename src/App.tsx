@@ -117,6 +117,7 @@ function Viewer({
   onPlaceAnnotation,
   onHighlightStart,
   onHighlightDrag,
+  onHighlightEnd,
   onSelectAnnotation,
   editingTextId,
   onStartTextEditing,
@@ -127,8 +128,10 @@ function Viewer({
   movingTextId,
   onHighlightResizeStart,
   onHighlightResize,
+  onHighlightResizeEnd,
   onTextResizeStart,
   onTextResize,
+  onTextResizeEnd,
   onPenCommit,
   selectedAnnotationId,
   onRenderError,
@@ -141,6 +144,7 @@ function Viewer({
   onPlaceAnnotation: (point: Point) => void;
   onHighlightStart: (point: Point) => string;
   onHighlightDrag: (id: string, start: Point, end: Point) => void;
+  onHighlightEnd: () => void;
   onSelectAnnotation: (id: string) => void;
   editingTextId: string | null;
   onStartTextEditing: (id: string) => void;
@@ -151,8 +155,10 @@ function Viewer({
   movingTextId: string | null;
   onHighlightResizeStart: (id: string, point: Point, handle: HighlightHandle) => void;
   onHighlightResize: (id: string, point: Point) => void;
+  onHighlightResizeEnd: (id: string) => void;
   onTextResizeStart: (id: string, point: Point, handle: HighlightHandle, bounds: ResizeBounds) => void;
   onTextResize: (id: string, point: Point) => void;
+  onTextResizeEnd: (id: string) => void;
   onPenCommit: (points: Point[]) => void;
   selectedAnnotationId: string | null;
   onRenderError: (message: string) => void;
@@ -287,6 +293,7 @@ function Viewer({
   const handlePointerUp = () => {
     if (highlightDrag.current) {
       highlightDrag.current = null;
+      onHighlightEnd();
       return;
     }
     if (annotationDrag.current?.moved) {
@@ -377,9 +384,16 @@ function Viewer({
               });
             }}
             onDoubleClick={(event) => {
-              const target = event.target instanceof Element ? event.target : null;
+              let target = event.target instanceof Element ? event.target : null;
+              // In select mode the layer holds pointer capture, so the event target is the layer itself.
+              // Hit-test by coordinates to find the text annotation under the cursor.
+              if (target && !target.closest("[data-text-annotation-id]")) {
+                target = window.document
+                  .elementsFromPoint(event.clientX, event.clientY)
+                  .find((element) => element.closest("[data-text-annotation-id]")) ?? target;
+              }
               const textAnnotationElement = target?.closest<HTMLElement>("[data-text-annotation-id]");
-              const textContent = target?.closest(".text-annotation-content");
+              const textContent = target?.closest(".text-annotation-content") ?? textAnnotationElement?.querySelector(".text-annotation-content");
               const annotationId = textAnnotationElement?.dataset.textAnnotationId;
               if (!annotationId || !textContent
                 || target?.closest(".annotation-resize-handle")
@@ -491,6 +505,7 @@ function Viewer({
                             height={annotation.boxHeight}
                             onResizeStart={(point, bounds) => onTextResizeStart(annotation.id, point, position, bounds)}
                             onResize={(point) => onTextResize(annotation.id, point)}
+                            onResizeEnd={() => onTextResizeEnd(annotation.id)}
                           />
                         ))}
                       </>
@@ -502,6 +517,7 @@ function Viewer({
                 <div
                   key={annotation.id}
                   className={`highlight-annotation${isSelected ? " selected" : ""}`}
+                  data-highlight-annotation-id={annotation.id}
                   style={{
                     left: `${annotation.x * 100}%`,
                     top: `${annotation.y * 100}%`,
@@ -530,6 +546,7 @@ function Viewer({
                           height={annotation.height}
                           onResizeStart={(point) => onHighlightResizeStart(annotation.id, point, position)}
                           onResize={(point) => onHighlightResize(annotation.id, point)}
+                          onResizeEnd={() => onHighlightResizeEnd(annotation.id)}
                         />
                       ))}
                     </>
@@ -594,6 +611,7 @@ function ResizeHandle({
   height,
   onResizeStart,
   onResize,
+  onResizeEnd,
 }: {
   shape: "highlight" | "text";
   position: HighlightHandle;
@@ -601,12 +619,37 @@ function ResizeHandle({
   height?: number;
   onResizeStart: (point: Point, bounds: ResizeBounds) => void;
   onResize: (point: Point) => void;
+  onResizeEnd?: () => void;
 }) {
   const activePointerId = useRef<number | null>(null);
+  const layerRectRef = useRef<DOMRect | null>(null);
+  const pendingPointRef = useRef<Point | null>(null);
+  const frameRef = useRef<number | null>(null);
+  const onResizeRef = useRef(onResize);
+  onResizeRef.current = onResize;
+  const onResizeEndRef = useRef(onResizeEnd);
+  onResizeEndRef.current = onResizeEnd;
+
+  const flushResize = () => {
+    if (frameRef.current !== null) {
+      cancelAnimationFrame(frameRef.current);
+      frameRef.current = null;
+    }
+    const point = pendingPointRef.current;
+    pendingPointRef.current = null;
+    if (point) onResizeRef.current(point);
+  };
+
+  useEffect(() => () => {
+    if (frameRef.current !== null) cancelAnimationFrame(frameRef.current);
+  }, []);
 
   const finishResize = (event: PointerEvent<HTMLSpanElement>) => {
     if (activePointerId.current !== event.pointerId) return;
+    flushResize();
     activePointerId.current = null;
+    onResizeEndRef.current?.();
+    layerRectRef.current = null;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
@@ -633,6 +676,7 @@ function ResizeHandle({
         if (!layer || !shapeRect) return;
         const rect = layer.getBoundingClientRect();
         if (rect.width <= 0 || rect.height <= 0) return;
+        layerRectRef.current = rect;
         activePointerId.current = event.pointerId;
         event.currentTarget.setPointerCapture(event.pointerId);
         onResizeStart({
@@ -642,12 +686,18 @@ function ResizeHandle({
       }}
       onPointerMove={(event) => {
         if (activePointerId.current !== event.pointerId) return;
-        const layer = event.currentTarget.closest(".annotation-layer");
-        if (!layer) return;
-        const rect = layer.getBoundingClientRect();
-        onResize({
+        const rect = layerRectRef.current;
+        if (!rect) return;
+        pendingPointRef.current = {
           x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
           y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)),
+        };
+        if (frameRef.current !== null) return;
+        frameRef.current = requestAnimationFrame(() => {
+          frameRef.current = null;
+          const point = pendingPointRef.current;
+          pendingPointRef.current = null;
+          if (point) onResizeRef.current(point);
         });
       }}
       onPointerUp={finishResize}
@@ -767,6 +817,7 @@ export default function App() {
     handle: HighlightHandle;
     point: Point;
     highlight: Extract<Annotation, { type: "highlight" }>;
+    latest?: Extract<Annotation, { type: "highlight" }>;
   } | null>(null);
   const textResizeRef = useRef<{
     id: string;
@@ -777,6 +828,7 @@ export default function App() {
     initialWidth: number;
     initialHeight: number;
     undoRecorded: boolean;
+    latest?: TextAnnotation;
   } | null>(null);
   const textEditRef = useRef<{ id: string; pageId: string; undoRecorded: boolean } | null>(null);
   editorStateRef.current = { pages, annotations, selectedPageId, selectedAnnotationId };
@@ -1131,6 +1183,23 @@ export default function App() {
     const initial = highlightResizeRef.current;
     if (!initial || initial.id !== id) return;
     const resized = resizeHighlightAnnotation(initial.highlight, initial.handle, initial.point, point);
+    // Preview directly on the DOM; the final box is committed to state once when the drag ends.
+    initial.latest = resized;
+    const element = window.document.querySelector<HTMLElement>(`[data-highlight-annotation-id="${id}"]`);
+    if (element) {
+      element.style.left = `${resized.x * 100}%`;
+      element.style.top = `${resized.y * 100}%`;
+      element.style.width = `${resized.width * 100}%`;
+      element.style.height = `${resized.height * 100}%`;
+    }
+  };
+
+  const finishHighlightResize = (id: string) => {
+    const initial = highlightResizeRef.current;
+    if (!initial || initial.id !== id) return;
+    highlightResizeRef.current = null;
+    const resized = initial.latest;
+    if (!resized) return;
     updateAnnotation(id, {
       x: resized.x,
       y: resized.y,
@@ -1174,16 +1243,31 @@ export default function App() {
       initial.initialWidth,
       initial.initialHeight,
     );
+    // Preview directly on the DOM so dragging does not re-render the whole app on every frame.
+    // The final box is committed to state once, when the drag ends.
+    initial.latest = resized;
+    const element = window.document.querySelector<HTMLElement>(`[data-text-annotation-id="${id}"]`);
+    if (element) {
+      element.style.left = `${resized.x * 100}%`;
+      element.style.top = `${resized.y * 100}%`;
+      element.style.width = `${(resized.boxWidth ?? 0) * 100}%`;
+      element.style.height = `${(resized.boxHeight ?? 0) * 100}%`;
+    }
+  };
+
+  const finishTextResize = (id: string) => {
+    const initial = textResizeRef.current;
+    if (!initial || initial.id !== id) return;
+    textResizeRef.current = null;
+    const resized = initial.latest;
+    if (!resized) return;
     const initialWidth = initial.annotation.boxWidth ?? initial.initialWidth;
     const initialHeight = initial.annotation.boxHeight ?? initial.initialHeight;
     if (resized.x === initial.annotation.x
       && resized.y === initial.annotation.y
       && resized.boxWidth === initialWidth
       && resized.boxHeight === initialHeight) return;
-    if (!initial.undoRecorded) {
-      recordUndo();
-      initial.undoRecorded = true;
-    }
+    recordUndo();
     updateCurrentAnnotations((existing) => existing.map((item) => item.id === id ? resized : item), initial.pageId);
   };
 
@@ -1511,6 +1595,7 @@ export default function App() {
                               return startHighlight(point, page.id);
                             }}
                             onHighlightDrag={(id, start, end) => dragHighlight(id, start, end, page.id)}
+                            onHighlightEnd={() => setTool("select")}
                             onSelectAnnotation={(id) => {
                               setSelectedPageId(page.id);
                               setSelectedAnnotationId(id);
@@ -1527,8 +1612,10 @@ export default function App() {
                             onAnnotationDrag={(id, point, shiftKey) => dragAnnotation(id, point, page.id, shiftKey)}
                             onTextResizeStart={(id, point, handle, bounds) => startTextResize(id, point, handle, bounds, page.id)}
                             onTextResize={resizeTextBox}
+                            onTextResizeEnd={finishTextResize}
                             onHighlightResizeStart={(id, point, handle) => startHighlightResize(id, point, handle, page.id)}
                             onHighlightResize={resizeHighlight}
+                            onHighlightResizeEnd={finishHighlightResize}
                             onPenCommit={(points) => {
                               setSelectedPageId(page.id);
                               addPenAnnotation(points, page.id);

@@ -76,13 +76,35 @@ type EditSnapshot = {
 };
 
 const EMPTY_ANNOTATIONS: AnnotationMap = {};
-const HIGHLIGHT_COLORS = [
-  { value: "#ffdb66", label: "Yellow" },
-  { value: "#8fdda0", label: "Green" },
-  { value: "#83caff", label: "Blue" },
-  { value: "#f7a8c4", label: "Pink" },
-  { value: "#ffc18a", label: "Orange" },
+const FONT_SIZE_MIN = 8;
+const FONT_SIZE_MAX = 48;
+const STANDARD_COLORS = ["#c00000", "#ff0000", "#ffc000", "#ffff00", "#92d050", "#00b050", "#00b0f0", "#0070c0", "#002060", "#7030a0"];
+const QUICK_COLORS = ["#000000", ...STANDARD_COLORS];
+const THEME_BASE_COLORS = ["#ffffff", "#000000", "#e7e6e6", "#44546a", "#4472c4", "#ed7d31", "#a5a5a5", "#ffc000", "#5b9bd5", "#70ad47"];
+
+function mixHex(hex: string, target: number, amount: number): string {
+  const channels = [1, 3, 5].map((index) => parseInt(hex.slice(index, index + 2), 16));
+  return `#${channels.map((channel) => Math.round(channel + (target - channel) * amount).toString(16).padStart(2, "0")).join("")}`;
+}
+
+// Row 0 is the base color; rows 1-5 are lighter-to-darker shades of each column.
+const THEME_PALETTE: string[][] = [
+  THEME_BASE_COLORS,
+  ...[0, 1, 2, 3, 4].map((row) => THEME_BASE_COLORS.map((color) => {
+    if (color === "#ffffff") return mixHex(color, 0, [0.05, 0.15, 0.25, 0.35, 0.5][row]);
+    if (color === "#000000") return mixHex(color, 255, [0.5, 0.35, 0.25, 0.15, 0.05][row]);
+    return row < 3 ? mixHex(color, 255, [0.8, 0.6, 0.4][row]) : mixHex(color, 0, [0.25, 0.5][row - 3]);
+  })),
 ];
+
+function hexToRgba(hex: string, alpha: number): string {
+  const value = hex.replace("#", "");
+  const full = value.length === 3 ? value.split("").map((c) => c + c).join("") : value;
+  const r = parseInt(full.slice(0, 2), 16);
+  const g = parseInt(full.slice(2, 4), 16);
+  const b = parseInt(full.slice(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
 
 function nextRotation(rotation: number): number {
   return (rotation + 90) % 360;
@@ -125,6 +147,7 @@ function Viewer({
   onFinishTextEditing,
   onAnnotationDragStart,
   onAnnotationDrag,
+  onAnnotationDragEnd,
   movingTextId,
   onHighlightResizeStart,
   onHighlightResize,
@@ -152,6 +175,7 @@ function Viewer({
   onFinishTextEditing: (id: string) => void;
   onAnnotationDragStart: (id: string, point: Point) => void;
   onAnnotationDrag: (id: string, point: Point, shiftKey: boolean) => void;
+  onAnnotationDragEnd: (id: string) => void;
   movingTextId: string | null;
   onHighlightResizeStart: (id: string, point: Point, handle: HighlightHandle) => void;
   onHighlightResize: (id: string, point: Point) => void;
@@ -278,8 +302,7 @@ function Viewer({
       const bounds = event.currentTarget.getBoundingClientRect();
       const dx = (current.x - annotationDrag.current.start.x) * bounds.width;
       const dy = (current.y - annotationDrag.current.start.y) * bounds.height;
-      if (!annotationDrag.current.moved && !isAnnotationDrag(dx, dy)) return;
-      if (!annotationDrag.current.moved) {
+      if (!annotationDrag.current.moved && isAnnotationDrag(dx, dy)) {
         annotationDrag.current.moved = true;
       }
       onAnnotationDrag(annotationDrag.current.id, current, event.shiftKey);
@@ -296,6 +319,7 @@ function Viewer({
       onHighlightEnd();
       return;
     }
+    if (annotationDrag.current) onAnnotationDragEnd(annotationDrag.current.id);
     if (annotationDrag.current?.moved) {
       const id = annotationDrag.current.id;
       if (suppressTextClickRef.current) window.clearTimeout(suppressTextClickRef.current.timer);
@@ -523,8 +547,7 @@ function Viewer({
                     top: `${annotation.y * 100}%`,
                     width: `${annotation.width * 100}%`,
                     height: `${annotation.height * 100}%`,
-                    backgroundColor: annotation.color,
-                    opacity: annotation.opacity ?? 0.35,
+                    backgroundColor: hexToRgba(annotation.color, annotation.opacity ?? 0.35),
                   }}
                   onClick={(event) => {
                     event.stopPropagation();
@@ -831,6 +854,8 @@ export default function App() {
     latest?: TextAnnotation;
   } | null>(null);
   const textEditRef = useRef<{ id: string; pageId: string; undoRecorded: boolean } | null>(null);
+  const clipboardRef = useRef<Annotation | null>(null);
+  const lastArrowMoveRef = useRef(0);
   editorStateRef.current = { pages, annotations, selectedPageId, selectedAnnotationId };
 
   const recordUndo = () => {
@@ -956,6 +981,35 @@ export default function App() {
       } else if ((event.ctrlKey || event.metaKey) && key === "y" && redoHistoryRef.current.length > 0) {
         event.preventDefault();
         redoEdit();
+      } else if ((event.ctrlKey || event.metaKey) && key === "c" && selectedAnnotation
+        && selectedAnnotation.type !== "pen" && !window.getSelection()?.toString()) {
+        event.preventDefault();
+        clipboardRef.current = { ...selectedAnnotation };
+      } else if ((event.ctrlKey || event.metaKey) && key === "v" && clipboardRef.current && currentPage) {
+        event.preventDefault();
+        const pasted = moveAnnotation({ ...clipboardRef.current, id: crypto.randomUUID() }, 0.015, 0.015);
+        clipboardRef.current = pasted;
+        recordUndo();
+        setAnnotations((existing) => ({
+          ...existing,
+          [currentPage.id]: [...(existing[currentPage.id] ?? []), pasted],
+        }));
+        setSelectedAnnotationId(pasted.id);
+        setEditingTextId(null);
+      } else if (key.startsWith("arrow") && !event.ctrlKey && !event.metaKey && !event.altKey
+        && selectedAnnotation && currentPage) {
+        event.preventDefault();
+        const step = event.shiftKey ? 0.02 : 0.004;
+        const dx = key === "arrowleft" ? -step : key === "arrowright" ? step : 0;
+        const dy = key === "arrowup" ? -step : key === "arrowdown" ? step : 0;
+        const now = Date.now();
+        if (now - lastArrowMoveRef.current > 600) recordUndo();
+        lastArrowMoveRef.current = now;
+        const moved = moveAnnotation(selectedAnnotation, dx, dy);
+        setAnnotations((existing) => ({
+          ...existing,
+          [currentPage.id]: (existing[currentPage.id] ?? []).map((item) => item.id === moved.id ? moved : item),
+        }));
       } else if (key === "delete" && selectedAnnotation && currentPage) {
         event.preventDefault();
         recordUndo();
@@ -1082,9 +1136,22 @@ export default function App() {
       URL.revokeObjectURL(url);
       setNotice(currentPageOnly ? "Current page downloaded as a PDF." : "Edited PDF downloaded to your device.");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Could not export this PDF.");
+      setError(cause instanceof Error ? cause.message : "Could not save this PDF.");
     }
   }, [annotations, currentPage, currentPageIndex, fileName, pages, sourceBytes]);
+
+  useEffect(() => {
+    const scroller = stageScrollRef.current;
+    if (!scroller) return;
+    const handleWheel = (event: WheelEvent) => {
+      if (!event.ctrlKey && !event.metaKey) return;
+      event.preventDefault();
+      const direction = event.deltaY < 0 ? 1 : -1;
+      setZoom((value) => Math.max(0.4, Math.min(1.6, Math.round((value + direction * 0.1) * 100) / 100)));
+    };
+    scroller.addEventListener("wheel", handleWheel, { passive: false });
+    return () => scroller.removeEventListener("wheel", handleWheel);
+  }, [pages.length > 0]);
 
   const updateCurrentAnnotations = (
     update: (existing: Annotation[]) => Annotation[],
@@ -1326,6 +1393,7 @@ export default function App() {
     start: Point;
     annotation: Annotation;
     undoRecorded: boolean;
+    latest?: Annotation;
   } | null>(null);
 
   const startAnnotationDrag = (id: string, point: Point, pageId = currentPage?.id) => {
@@ -1348,7 +1416,7 @@ export default function App() {
     if (!drag || drag.id !== id) return;
     const dx = point.x - drag.start.x;
     const dy = point.y - drag.start.y;
-    if (!drag.undoRecorded && Math.hypot(dx, dy) < 0.002) return;
+    if (!drag.undoRecorded && dx === 0 && dy === 0) return;
     if (!drag.undoRecorded) {
       recordUndo();
       drag.undoRecorded = true;
@@ -1357,7 +1425,29 @@ export default function App() {
       ? constrainTextDragDelta(dx, dy, shiftKey)
       : { x: dx, y: dy };
     const moved = moveAnnotation(drag.annotation, delta.x, delta.y);
-    updateCurrentAnnotations((existing) => existing.map((item) => item.id === id ? moved : item), pageId);
+    drag.latest = moved;
+    if (moved.type === "pen") {
+      updateCurrentAnnotations((existing) => existing.map((item) => item.id === id ? moved : item), pageId);
+      return;
+    }
+    // Preview directly on the DOM so dragging does not re-render the whole app on every move.
+    // The final position is committed to state once, when the drag ends.
+    const element = window.document.querySelector<HTMLElement>(
+      `[data-text-annotation-id="${id}"], [data-highlight-annotation-id="${id}"]`,
+    );
+    if (element) {
+      element.style.left = `${moved.x * 100}%`;
+      element.style.top = `${moved.y * 100}%`;
+    }
+  };
+
+  const finishAnnotationDrag = (id: string) => {
+    const drag = annotationDragRef.current;
+    if (!drag || drag.id !== id) return;
+    annotationDragRef.current = null;
+    const moved = drag.latest;
+    if (!moved || moved.type === "pen") return;
+    updateCurrentAnnotations((existing) => existing.map((item) => item.id === id ? moved : item), drag.pageId);
   };
 
   const deleteSelectedAnnotation = () => {
@@ -1436,8 +1526,7 @@ export default function App() {
     <div className="app-shell" onDragOver={(event) => event.preventDefault()} onDrop={handleDrop}>
       <header className="topbar">
         <div className="brand-group">
-          <div className="brand-mark"><FileText size={18} strokeWidth={2.2} /></div>
-          <span className="brand-name">paperplane</span>
+          <img className="brand-logo" src="/paperplane-logo-header.png" alt="Paperplane" />
           <span className="brand-divider" />
           {sourceBytes ? (
             <div className="document-title">
@@ -1470,7 +1559,7 @@ export default function App() {
             <Upload size={15} /> Open PDF
           </button>
           <button className="button button-primary" disabled={!sourceBytes} onClick={() => void downloadPdf()}>
-            <Download size={15} /> Export PDF
+            <Download size={15} /> Save PDF
           </button>
         </div>
       </header>
@@ -1502,7 +1591,7 @@ export default function App() {
             <div className="welcome-bottom">
               <span><Type size={15} /> Add text & mark up</span><i />
               <span><Files size={15} /> Organize pages</span><i />
-              <span><Download size={15} /> Export locally</span>
+              <span><Download size={15} /> Save locally</span>
             </div>
           </section>
         ) : (
@@ -1610,6 +1699,7 @@ export default function App() {
                             onFinishTextEditing={finishTextEditing}
                             onAnnotationDragStart={(id, point) => startAnnotationDrag(id, point, page.id)}
                             onAnnotationDrag={(id, point, shiftKey) => dragAnnotation(id, point, page.id, shiftKey)}
+                            onAnnotationDragEnd={finishAnnotationDrag}
                             onTextResizeStart={(id, point, handle, bounds) => startTextResize(id, point, handle, bounds, page.id)}
                             onTextResize={resizeTextBox}
                             onTextResizeEnd={finishTextResize}
@@ -1644,28 +1734,9 @@ export default function App() {
               </div>
               {rightPanel === "properties" ? (
                 <div className="inspector-content">
-                  <div className="inspector-title"><h2>{selectedAnnotation ? "Edit markup" : "Page tools"}</h2><p>{selectedAnnotation ? "Adjust your selected annotation." : "Organize and export your pages."}</p></div>
+                  <div className="inspector-title"><h2>{selectedAnnotation ? "Edit markup" : "Page tools"}</h2><p>{selectedAnnotation ? "Adjust your selected annotation." : "Organize and save your pages."}</p></div>
                   {selectedAnnotation?.type === "text" ? (
                     <div className="property-section">
-                      <button
-                        type="button"
-                        className={`action-row text-move-control${movingTextId === selectedAnnotation.id ? " active" : ""}`}
-                        aria-pressed={movingTextId === selectedAnnotation.id}
-                        onClick={() => {
-                          const moveActive = movingTextId === selectedAnnotation.id;
-                          setTool("select");
-                          setEditingTextId(null);
-                          textEditRef.current = null;
-                          setMovingTextId(moveActive ? null : selectedAnnotation.id);
-                        }}
-                      >
-                        <MoveUpRight size={16} /><span>{movingTextId === selectedAnnotation.id ? "Move mode on" : "Move text box"}</span>
-                      </button>
-                      {movingTextId === selectedAnnotation.id && (
-                        <p className="resize-hint">Drag the selected box to move it. Hold Shift to constrain movement to one axis.</p>
-                      )}
-                      <label className="field-label" htmlFor="text-content">Text</label>
-                      <textarea id="text-content" className="text-input" value={selectedAnnotation.text} onChange={(event) => updateTextAnnotation(selectedAnnotation.id, event.target.value)} rows={3} />
                       <div className="field-row"><span className="field-label">Style</span><div className="text-style-buttons">
                         <button type="button" className={selectedAnnotation.bold ? "active" : ""} aria-label="Bold text" aria-pressed={Boolean(selectedAnnotation.bold)} onClick={() => updateAnnotation(selectedAnnotation.id, { bold: !selectedAnnotation.bold })}><Bold size={15} /></button>
                         <button type="button" className={selectedAnnotation.italic ? "active" : ""} aria-label="Italic text" aria-pressed={Boolean(selectedAnnotation.italic)} onClick={() => updateAnnotation(selectedAnnotation.id, { italic: !selectedAnnotation.italic })}><Italic size={15} /></button>
@@ -1674,7 +1745,7 @@ export default function App() {
                       <div className="select-wrap"><select id="font-family" value={annotationFont} onChange={(event) => updateAnnotation(selectedAnnotation.id, { font: event.target.value as FontName })}>
                         <option value="Helvetica">Helvetica</option><option value="TimesRoman">Times New Roman</option><option value="Courier">Courier</option>
                       </select><ChevronDown size={14} /></div>
-                      <div className="field-row"><label className="field-label" htmlFor="font-size">Size</label><span className="field-value">{selectedAnnotation.fontSize} pt</span></div>
+                      <div className="field-row"><label className="field-label" htmlFor="font-size-number">Size</label><FontSizeField value={selectedAnnotation.fontSize} onChange={(fontSize) => updateAnnotation(selectedAnnotation.id, { fontSize })} /></div>
                       <input id="font-size" type="range" min="8" max="48" step="1" value={selectedAnnotation.fontSize} onChange={(event) => updateAnnotation(selectedAnnotation.id, { fontSize: Number(event.target.value) })} />
                       <ColorPicker value={selectedAnnotation.color} onChange={(color) => updateAnnotation(selectedAnnotation.id, { color })} />
                       <button className="delete-markup" onClick={deleteSelectedAnnotation}><Trash2 size={15} /> Remove text</button>
@@ -1710,7 +1781,7 @@ export default function App() {
                       </div>
                       <div className="property-divider" />
                       <div className="property-section">
-                        <div className="section-label">EXPORT</div>
+                        <div className="section-label">SAVE</div>
                         <button className="action-row" onClick={() => void downloadPdf(true)}><Download size={16} /><span>Download this page</span><MoveUpRight size={14} className="action-trailing" /></button>
                       </div>
                       <div className="font-note"><Info size={15} /><p>Text you add uses the font options above. Existing PDF text stays as originally embedded.</p></div>
@@ -1723,7 +1794,7 @@ export default function App() {
                   <div className="inspector-title"><h2>PDF toolkit</h2><p>Every tool is designed to work on-device.</p></div>
                   <div className="toolkit-group-title">READY TO USE</div>
                   <button className="toolkit-card" onClick={() => mergeInputRef.current?.click()}><span className="toolkit-icon blue"><Files size={17} /></span><span><b>Merge PDFs</b><small>Add another PDF to this file</small></span><ChevronRight size={15} /></button>
-                  <button className="toolkit-card" onClick={() => void downloadPdf(true)}><span className="toolkit-icon green"><Download size={17} /></span><span><b>Extract a page</b><small>Export the current page alone</small></span><ChevronRight size={15} /></button>
+                  <button className="toolkit-card" onClick={() => void downloadPdf(true)}><span className="toolkit-icon green"><Download size={17} /></span><span><b>Extract a page</b><small>Save the current page alone</small></span><ChevronRight size={15} /></button>
                   <div className="toolkit-group-title coming-title">ON THE ROADMAP <span>COMING SOON</span></div>
                   {[
                     ["Compress PDF", "Reduce file size"],
@@ -1752,27 +1823,259 @@ export default function App() {
   );
 }
 
-function ColorPicker({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+function FontSizeField({ value, onChange }: { value: number; onChange: (value: number) => void }) {
+  const [draft, setDraft] = useState(String(value));
+  useEffect(() => setDraft(String(value)), [value]);
+
+  const commit = () => {
+    const parsed = Math.round(Number(draft));
+    if (!draft.trim() || Number.isNaN(parsed)) {
+      setDraft(String(value));
+      return;
+    }
+    const clamped = Math.max(FONT_SIZE_MIN, Math.min(FONT_SIZE_MAX, parsed));
+    setDraft(String(clamped));
+    if (clamped !== value) onChange(clamped);
+  };
+
   return (
-    <div className="color-field">
+    <div className="font-size-field">
+      <input
+        id="font-size-number"
+        type="number"
+        aria-label="Font size in points"
+        min={FONT_SIZE_MIN}
+        max={FONT_SIZE_MAX}
+        step={1}
+        value={draft}
+        onChange={(event) => {
+          setDraft(event.target.value);
+          const parsed = Number(event.target.value);
+          if (Number.isInteger(parsed) && parsed >= FONT_SIZE_MIN && parsed <= FONT_SIZE_MAX && parsed !== value) {
+            onChange(parsed);
+          }
+        }}
+        onBlur={commit}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") commit();
+        }}
+      />
+      <span>pt</span>
+    </div>
+  );
+}
+
+function ColorPicker({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const [custom, setCustom] = useState(false);
+  const fieldRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const close = (event: globalThis.PointerEvent) => {
+      if (event.target instanceof Node && fieldRef.current?.contains(event.target)) return;
+      setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("pointerdown", close);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", close);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+
+  const choose = (color: string) => {
+    onChange(color);
+    setOpen(false);
+  };
+  const swatch = (color: string, label: string) => (
+    <button
+      key={`${label}-${color}`}
+      type="button"
+      className={`palette-swatch${value.toLowerCase() === color.toLowerCase() ? " active" : ""}`}
+      style={{ backgroundColor: color }}
+      aria-label={`${label} ${color}`}
+      title={label}
+      onClick={() => choose(color)}
+    />
+  );
+
+  return (
+    <div className="color-field" ref={fieldRef}>
+      <div className="color-row">
       <label className="field-label">Color</label>
       <div className="color-options">
-        {HIGHLIGHT_COLORS.map((color) => (
+        <button
+          type="button"
+          className="custom-color-control"
+          title="More colors"
+          aria-label="More colors"
+          aria-expanded={open}
+          onClick={() => {
+            setCustom(false);
+            setOpen((current) => !current);
+          }}
+        >
+          <Plus size={13} />
+        </button>
+      </div>
+      </div>
+      <div className="quick-colors">
+        {QUICK_COLORS.map((color) => (
           <button
-            key={color.value}
-            className={`color-swatch${value.toLowerCase() === color.value ? " active" : ""}`}
-            style={{ backgroundColor: color.value }}
-            aria-label={`${color.label} highlight color`}
-            aria-pressed={value.toLowerCase() === color.value}
-            title={color.label}
-            onClick={() => onChange(color.value)}
+            key={color}
+            type="button"
+            className={`color-swatch${value.toLowerCase() === color ? " active" : ""}`}
+            style={{ backgroundColor: color, borderColor: color }}
+            aria-label={`Color ${color}`}
+            aria-pressed={value.toLowerCase() === color}
+            title={color}
+            onClick={() => onChange(color)}
           />
         ))}
-        <label className="custom-color-control" title="Choose a custom color" style={{ backgroundColor: value }}>
-          <input type="color" aria-label="Choose custom highlight color" value={value} onChange={(event) => onChange(event.target.value)} />
-          <span><Plus size={13} /></span>
-        </label>
       </div>
+      {open && (
+        <div className="color-palette" role="dialog" aria-label="More colors">
+          {custom ? (
+            <CustomColorPicker value={value} onChange={onChange} onBack={() => setCustom(false)} />
+          ) : (
+            <>
+              <div className="palette-title">Theme Colors</div>
+              <div className="palette-grid">
+                {THEME_PALETTE.map((row, rowIndex) => row.map((color, columnIndex) => swatch(color, `Theme color ${columnIndex + 1}${rowIndex === 0 ? "" : `, shade ${rowIndex}`}`)))}
+              </div>
+              <button type="button" className="palette-more" onClick={() => setCustom(true)}>More Colors…</button>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+type Hsv = { h: number; s: number; v: number };
+
+function hexToHsv(hex: string): Hsv {
+  const r = parseInt(hex.slice(1, 3), 16) / 255;
+  const g = parseInt(hex.slice(3, 5), 16) / 255;
+  const b = parseInt(hex.slice(5, 7), 16) / 255;
+  const max = Math.max(r, g, b);
+  const d = max - Math.min(r, g, b);
+  let h = 0;
+  if (d !== 0) {
+    if (max === r) h = ((g - b) / d) % 6;
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h = (h * 60 + 360) % 360;
+  }
+  return { h, s: max === 0 ? 0 : d / max, v: max };
+}
+
+function hsvToHex({ h, s, v }: Hsv): string {
+  const f = (n: number) => {
+    const k = (n + h / 60) % 6;
+    return v - v * s * Math.max(0, Math.min(k, 4 - k, 1));
+  };
+  return `#${[f(5), f(3), f(1)].map((channel) => Math.round(channel * 255).toString(16).padStart(2, "0")).join("")}`;
+}
+
+function CustomColorPicker({ value, onChange, onBack }: { value: string; onChange: (value: string) => void; onBack: () => void }) {
+  const [hsv, setHsv] = useState<Hsv>(() => hexToHsv(value));
+  const [draft, setDraft] = useState(value.slice(1).toUpperCase());
+  const hsvRef = useRef(hsv);
+  const dragRef = useRef<"area" | "hue" | null>(null);
+  const areaRef = useRef<HTMLDivElement>(null);
+  const hueRef = useRef<HTMLDivElement>(null);
+  const hex = hsvToHex(hsv);
+
+  const apply = (next: Hsv) => {
+    hsvRef.current = next;
+    setHsv(next);
+    setDraft(hsvToHex(next).slice(1).toUpperCase());
+  };
+
+  const pick = (kind: "area" | "hue", event: PointerEvent<HTMLDivElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const x = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+    const y = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+    apply(kind === "area" ? { ...hsvRef.current, s: x, v: 1 - y } : { ...hsvRef.current, h: x * 360 });
+  };
+
+  const startDrag = (kind: "area" | "hue") => (event: PointerEvent<HTMLDivElement>) => {
+    event.currentTarget.setPointerCapture(event.pointerId);
+    dragRef.current = kind;
+    pick(kind, event);
+  };
+  const moveDrag = (kind: "area" | "hue") => (event: PointerEvent<HTMLDivElement>) => {
+    if (dragRef.current === kind) pick(kind, event);
+  };
+  // The color is committed once on release so a drag creates a single undo step.
+  const endDrag = () => {
+    if (!dragRef.current) return;
+    dragRef.current = null;
+    onChange(hsvToHex(hsvRef.current));
+  };
+
+  const commitDraft = (text: string) => {
+    const digits = text.replace("#", "");
+    const full = digits.length === 3 ? digits.split("").map((c) => c + c).join("") : digits;
+    if (!/^[0-9a-fA-F]{6}$/.test(full)) return false;
+    const color = `#${full.toLowerCase()}`;
+    hsvRef.current = hexToHsv(color);
+    setHsv(hsvRef.current);
+    setDraft(full.toUpperCase());
+    onChange(color);
+    return true;
+  };
+
+  return (
+    <div className="custom-picker">
+      <div
+        ref={areaRef}
+        className="picker-area"
+        style={{ backgroundColor: `hsl(${hsv.h}, 100%, 50%)` }}
+        onPointerDown={startDrag("area")}
+        onPointerMove={moveDrag("area")}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+      >
+        <span className="picker-thumb" style={{ left: `${hsv.s * 100}%`, top: `${(1 - hsv.v) * 100}%` }} />
+      </div>
+      <div className="picker-controls">
+        <span className="picker-preview" style={{ backgroundColor: hex }} />
+        <div
+          ref={hueRef}
+          className="picker-hue"
+          onPointerDown={startDrag("hue")}
+          onPointerMove={moveDrag("hue")}
+          onPointerUp={endDrag}
+          onPointerCancel={endDrag}
+        >
+          <span className="picker-thumb" style={{ left: `${(hsv.h / 360) * 100}%`, backgroundColor: `hsl(${hsv.h}, 100%, 50%)` }} />
+        </div>
+      </div>
+      <label className="picker-hex">
+        <span>Hex</span>
+        <b>#</b>
+        <input
+          type="text"
+          aria-label="Hex color code"
+          maxLength={7}
+          spellCheck={false}
+          value={draft}
+          onChange={(event) => {
+            setDraft(event.target.value);
+            const digits = event.target.value.replace("#", "");
+            if (digits.length === 6) commitDraft(digits);
+          }}
+          onBlur={() => { if (!commitDraft(draft)) setDraft(hex.slice(1).toUpperCase()); }}
+          onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }}
+        />
+      </label>
+      <button type="button" className="palette-more" onClick={onBack}>Back to palette</button>
     </div>
   );
 }

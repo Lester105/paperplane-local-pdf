@@ -89,8 +89,3 @@ The generated static files are in `dist/`; the app only needs a local web server
 - Quick, private PDF annotations without uploading sensitive documents to a cloud service.
 - Lightweight text overlays and highlights on documents locally.
 - A privacy-first alternative to online PDF editors.
-
-## 📄 License
-
-This project is open-source and available under the MIT License.
-```

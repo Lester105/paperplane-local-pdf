@@ -1,3 +1,4 @@
+
 <h1 align="center">✈️ Paperplane — Local PDF Studio</h1>
 
 <p align="center">
@@ -45,3 +46,51 @@ npm install
 
 # 2. Start the development server
 npm run dev
+```
+
+Open the localhost URL printed by Vite (by default `http://127.0.0.1:5173`).
+
+### Production Build
+
+```bash
+# Build static files
+npm run build
+
+# Preview the production build locally
+npm run preview
+```
+
+The generated static files are in `dist/`; the app only needs a local web server to serve them. Runtime JavaScript, the PDF.js worker, and styles are bundled with the app—there are no CDN requests.
+
+## 📁 Project Structure
+
+```text
+├── .github/workflows/       # GitHub Actions for Pages deployment
+├── src/                     # Application source code (TypeScript)
+├── index.html               # Entry HTML
+├── vite.config.ts           # Vite configuration
+├── tsconfig.json            # TypeScript root config
+├── tsconfig.app.json        # App-specific TS config
+├── tsconfig.node.json       # Node-specific TS config
+├── package.json             # Dependencies and scripts
+└── dist/                    # Generated static build (after npm run build)
+```
+
+## 🔒 Editing & Privacy Notes
+
+- Text added in Paperplane is an **editable overlay** in the current in-memory document and is written into the exported PDF.
+- The original text already inside a PDF is **not** edited or reflowed; it remains as-is.
+- Replacing embedded fonts throughout arbitrary PDFs is not reliably supported by this MVP.
+- Added text uses the three bundled PDF standard fonts, not every font installed on the computer.
+- The app **does not send or automatically store files anywhere**. Use **Export PDF** to save a copy through the browser's normal download flow.
+
+## 💡 Use Cases
+
+- Quick, private PDF annotations without uploading sensitive documents to a cloud service.
+- Lightweight text overlays and highlights on documents locally.
+- A privacy-first alternative to online PDF editors.
+
+## 📄 License
+
+This project is open-source and available under the MIT License.
+```
